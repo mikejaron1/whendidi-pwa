@@ -95,10 +95,31 @@ you don't mind one more questionnaire.
 |---|---|
 | App icon 512×512 | ✅ `store/icon-512.png` |
 | Feature graphic 1024×500 | ✅ `store/feature-graphic.png` |
-| Phone screenshots (2–8 required) | ✅ `store/screenshots/` (6 @ 1080×1920) |
+| Phone screenshots (2–8 required) | ✅ `store/screenshots/framed/` (6 @ 1080×1920) |
 
 Regenerate any time with `npm run screenshots` — it seeds deterministic demo
 data in a throwaway Chrome profile, so no personal data ever reaches the store.
+
+Two sets are produced:
+
+- `store/screenshots/framed/` — **upload these.** Each pairs a headline with a
+  partial, bleeding screenshot on the brand background. Play crops the listing
+  carousel tightly, so a plain capture loses its detail at thumbnail size while
+  a headline still reads.
+- `store/screenshots/*.png` — the raw captures the framed set is built from.
+  Kept for the web listing and as a fallback.
+
+Upload order matters: Play shows the first two or three most often, so the
+sequence leads with the differentiator rather than the logging basics.
+
+| # | File | Headline |
+| --- | --- | --- |
+| 1 | `f1-insights.png` | Most trackers count. Plotline explains. |
+| 2 | `f2-findings.png` | Findings in plain English. |
+| 3 | `f3-categories.png` | One tap to log. |
+| 4 | `f4-statistics.png` | See the shape of a habit. |
+| 5 | `f5-recent.png` | Goals that hold you to it. |
+| 6 | `f6-day.png` | Nothing leaves your phone. |
 
 ## Data safety form
 

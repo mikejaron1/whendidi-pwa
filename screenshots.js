@@ -204,12 +204,11 @@ async function main() {
 
   // The repo ships a Drive client ID in config.js, so a fresh profile tries to
   // auto-sync, fails (no token), and parks a "tap to fix" pill in the header.
-  // Clear it so it stays out of the store images.
-  await page.evaluate(() => {
-    window.CW_CONFIG.driveClientId = '';
-    const pill = document.getElementById('syncPill');
-    if (pill) { pill.textContent = ''; pill.style.display = 'none'; }
-  });
+  // Clearing it once is not enough: any later failed sync calls setStatus and
+  // puts it straight back. A style rule wins permanently, including for
+  // elements re-created after this point.
+  await page.evaluate(() => { window.CW_CONFIG.driveClientId = ''; });
+  await page.addStyleTag({ content: '#syncPill{display:none !important}' });
 
   const shots = [
     ['01-categories', 'categories'],
@@ -240,8 +239,67 @@ async function main() {
   await page.screenshot({ path: path.join(OUT, '04-findings.png') });
   console.log('  04-findings.png');
 
+  await frameShots(page);
+
   await browser.close();
   server.close();
+}
+
+/* ---------- captioned store frames -------------------------------------- */
+/* Raw captures show the app but not the pitch. These wrap each one in a
+ * branded card with a headline, and let the screenshot bleed off the bottom
+ * edge so the frame reads as a poster rather than a phone dump. */
+const BRAND = '#ff7a2f';
+const INK_BOT = '#0d1120';
+
+const FRAMES = [
+  ['03-insights',   'Most trackers count.\nPlotline explains.',
+                    'Real statistics over your own log — not just a prettier chart.'],
+  ['04-findings',   'Findings in plain\nEnglish.',
+                    'Corrected for false discoveries, so you are not chasing noise.'],
+  ['01-categories', 'One tap to log.',
+                    'Counts, amounts, durations, severity — whatever the thing needs.'],
+  ['02-statistics', 'See the shape\nof a habit.',
+                    'Totals, trends, and time since last on every topic.'],
+  ['06-recent',     'Goals that hold\nyou to it.',
+                    'Set a target, keep the streak, beat your own record.'],
+  ['05-day',        'Nothing leaves\nyour phone.',
+                    'No account, no server, no ads. Works fully offline.'],
+];
+
+async function frameShots(page) {
+  const outDir = path.join(OUT, 'framed');
+  fs.mkdirSync(outDir, { recursive: true });
+
+  for (const [src, headline, sub] of FRAMES) {
+    const b64 = fs.readFileSync(path.join(OUT, `${src}.png`)).toString('base64');
+    const html = `<!doctype html><meta charset="utf-8"><style>
+      *{margin:0;padding:0;box-sizing:border-box}
+      body{width:1080px;height:1920px;overflow:hidden;color:#fff;
+        background:radial-gradient(120% 130% at 10% 6%, #2b3459 0%, ${INK_BOT} 60%);
+        font-family:-apple-system,"Helvetica Neue",Helvetica,Arial,sans-serif}
+      .copy{padding:104px 84px 0}
+      h1{font-size:76px;font-weight:700;letter-spacing:-2.4px;line-height:1.06;
+        white-space:pre-line}
+      p{margin-top:26px;font-size:33px;line-height:1.4;color:#aeb8d8;
+        letter-spacing:-.2px;max-width:900px}
+      .rule{width:104px;height:9px;border-radius:5px;background:${BRAND};margin-top:38px}
+      .device{position:absolute;left:50%;transform:translateX(-50%);top:566px;
+        width:930px;height:1354px;overflow:hidden;border-radius:46px;
+        border:11px solid rgba(255,255,255,.10);
+        box-shadow:0 40px 90px rgba(0,0,0,.55)}
+      .device img{display:block;width:100%}
+    </style>
+    <div class="copy"><h1>${headline}</h1><p>${sub}</p><div class="rule"></div></div>
+    <div class="device"><img src="data:image/png;base64,${b64}"></div>`;
+
+    await page.setViewportSize({ width: 1080, height: 1920 });
+    await page.setContent(html, { waitUntil: 'load' });
+    await page.waitForTimeout(250);
+    const name = `f${FRAMES.findIndex((f) => f[0] === src) + 1}-${src.slice(3)}.png`;
+    await page.screenshot({ path: path.join(outDir, name) });
+    console.log(`  framed/${name}`);
+  }
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
