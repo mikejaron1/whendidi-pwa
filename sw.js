@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'v7.6.1';
+const CACHE_VERSION = 'v7.6.2';
 
 const SHELL = [
   './',

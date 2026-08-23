@@ -56,6 +56,17 @@ let _tokenExpiry = 0;
 let _autoSyncTimer = null;
 let _consecutiveSilentFailures = 0;
 
+/* Background sync gives up after this many consecutive silent failures.
+ * An unauthorised or misconfigured token fails identically every time, so
+ * retrying on every launch and every edit just burns requests and keeps the
+ * status pill churning. Cleared by a successful token grant, by an explicit
+ * interactive sync, or by a client ID change. */
+const MAX_SILENT_AUTH_FAILURES = 2;
+
+function autoSyncSuppressed() {
+  return _consecutiveSilentFailures >= MAX_SILENT_AUTH_FAILURES;
+}
+
 /* ---------- helpers ---------- */
 
 function loadScript(src) {
@@ -572,6 +583,9 @@ function mergeBackups(base, local, remote, { preferRemote = false } = {}) {
  * recently, and reported back to the caller so the UI can mention it.
  */
 async function syncNow({ interactive = false, allowMerge = true, force = false } = {}) {
+  // An explicit request re-arms background sync: the user has likely just
+  // fixed whatever was failing, and is entitled to a fresh set of attempts.
+  if (interactive) _consecutiveSilentFailures = 0;
   const clientId = await getClientId();
   if (!clientId) throw new Error('NO_CLIENT_ID');
   if (!isOnline()) throw new Error('OFFLINE');
@@ -681,6 +695,7 @@ function queueAutoSync(reason = 'change') {
   // is what breaks conflict ties on the next manual sync.
   CWDB.setMeta('lastLocalChangeAt', Date.now()).catch(() => {});
   if (!CFG().autoSyncOnChange) return;
+  if (autoSyncSuppressed()) return;
   const debounce = Math.max(1000, Number(CFG().autoSyncDebounceMs) || 5000);
   if (_autoSyncTimer) clearTimeout(_autoSyncTimer);
   setStatus('', '☁ queued…');
@@ -718,13 +733,17 @@ function handleAutoSyncFailure(e) {
   // Token / OAuth errors: silent prompt failed — needs user action.
   _consecutiveSilentFailures++;
   setStatus('error', '☁ tap to fix');
-  // After 2 silent failures, give up auto-syncing until user taps Sync Now.
+  // Once this reaches MAX_SILENT_AUTH_FAILURES, autoSyncSuppressed() stops
+  // further background attempts until the user taps Sync now.
 }
 
 async function startupSync() {
   if (!CFG().autoSyncOnStartup) return;
   const clientId = await getClientId();
   if (!clientId) return;
+  // Surface the pill even when suppressed, or a fresh launch would show no
+  // sign at all that sync is broken.
+  if (autoSyncSuppressed()) { setStatus('error', '☁ tap to fix'); return; }
   const last = await CWDB.getMeta('lastDriveSync', 0);
   const gap = Date.now() - (last || 0);
   // Short gap only: sync is two-way now, so opening the app is how we find
@@ -751,6 +770,7 @@ function resetTokenClient() {
   _tokenClient = null;
   _accessToken = null;
   _tokenExpiry = 0;
+  _consecutiveSilentFailures = 0;
 }
 
 function esc(s) {

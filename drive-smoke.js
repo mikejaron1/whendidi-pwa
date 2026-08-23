@@ -100,7 +100,9 @@ global.CWIO = window.CWIO = {};
 const src = fs.readFileSync(path.join(__dirname, 'js', 'drive.js'), 'utf8');
 const probe = `
 window.__test = { rotateVersions, cleanupLegacyArtifacts, maybeCleanupLegacyArtifacts,
-                  findFileInFolder, DRIVE_MAX_VERSIONS, DRIVE_MIN_SNAPSHOT_GAP_MS };
+                  findFileInFolder, DRIVE_MAX_VERSIONS, DRIVE_MIN_SNAPSHOT_GAP_MS,
+                  handleAutoSyncFailure, autoSyncSuppressed, resetTokenClient,
+                  queueAutoSync, MAX_SILENT_AUTH_FAILURES };
 `;
 new Function(src + probe)();
 const T = window.__test;
@@ -249,6 +251,63 @@ async function test(name, fn) {
     add({ name: 'plotline-1.json', parents: [fid], content: json(1) });
     await T.maybeCleanupLegacyArtifacts(fid);
     assert.strictEqual(calls.trash, 1, 'second sweep ran inside the 24h window');
+  });
+
+  console.log('\nauto-sync backoff');
+
+  /* A broken token fails identically every time. Without a backoff the app
+   * retries on every launch and every edit, which is what these cover. */
+  const failAuth = (n) => {
+    for (let i = 0; i < n; i++) T.handleAutoSyncFailure(new Error('access_denied'));
+  };
+
+  await test('a fresh session is not suppressed', async () => {
+    T.resetTokenClient();
+    assert.strictEqual(T.autoSyncSuppressed(), false);
+  });
+
+  await test('suppression engages only after the configured failure count', async () => {
+    T.resetTokenClient();
+    failAuth(T.MAX_SILENT_AUTH_FAILURES - 1);
+    assert.strictEqual(T.autoSyncSuppressed(), false, 'suppressed too early');
+    failAuth(1);
+    assert.strictEqual(T.autoSyncSuppressed(), true, 'never suppressed');
+  });
+
+  await test('transient conditions never count toward the backoff', async () => {
+    T.resetTokenClient();
+    for (const code of ['OFFLINE', 'CELLULAR_BLOCKED', 'NO_CLIENT_ID']) {
+      for (let i = 0; i < T.MAX_SILENT_AUTH_FAILURES + 3; i++) {
+        T.handleAutoSyncFailure(new Error(code));
+      }
+    }
+    assert.strictEqual(T.autoSyncSuppressed(), false,
+      'being offline or on cellular should not disable auto-sync');
+  });
+
+  await test('suppressed auto-sync stops scheduling work', async () => {
+    T.resetTokenClient();
+    window.CW_CONFIG.autoSyncOnChange = true;
+    const realTimeout = global.setTimeout;
+    let scheduled = 0;
+    global.setTimeout = (fn, ms) => { scheduled++; return realTimeout(() => {}, 0); };
+    try {
+      T.queueAutoSync('change');
+      assert.strictEqual(scheduled, 1, 'healthy session should schedule a sync');
+      failAuth(T.MAX_SILENT_AUTH_FAILURES);
+      T.queueAutoSync('change');
+      assert.strictEqual(scheduled, 1, 'scheduled a sync while suppressed');
+    } finally {
+      global.setTimeout = realTimeout;
+    }
+  });
+
+  await test('reconnecting re-arms auto-sync', async () => {
+    T.resetTokenClient();
+    failAuth(T.MAX_SILENT_AUTH_FAILURES);
+    assert.strictEqual(T.autoSyncSuppressed(), true);
+    T.resetTokenClient();
+    assert.strictEqual(T.autoSyncSuppressed(), false, 'still suppressed after reconnecting');
   });
 
   console.log(failures ? `\n${failures} failing` : '\nall passing');

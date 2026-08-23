@@ -15,7 +15,7 @@
 /* App version — BUMP THIS on every change so you can confirm which
  * build is actually running on your device. Shown at the bottom of
  * the ☰ menu. Keep it in sync with CACHE_VERSION in sw.js. */
-window.CW_VERSION = 'v7.6.1 · Plotline · 2026-08-21';
+window.CW_VERSION = 'v7.6.2 · Plotline · 2026-08-23';
 
 window.CW_CONFIG = {
   // Google OAuth 2.0 Client ID (Web application) used by default. Users can
