@@ -1,6 +1,6 @@
 /* UI smoke test.
  *
- * Loads the real index.html + app scripts in jsdom against a fake IndexedDB,
+ * Loads the real app/index.html + app scripts in jsdom against a fake IndexedDB,
  * so a runtime error in rendering fails loudly here instead of on the phone.
  * Covers first-launch onboarding, every tab, the insights analysis, and the
  * role editor round-trip.
@@ -19,7 +19,9 @@ const vc = new VirtualConsole();
 vc.on('jsdomError', (e) => errors.push('jsdomError: ' + (e.detail?.stack || e.message)));
 vc.on('error', (...a) => errors.push('console.error: ' + a.join(' ')));
 
-const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8')
+const APP_HTML = path.join(ROOT, 'app', 'index.html');
+
+const html = fs.readFileSync(APP_HTML, 'utf8')
   .replace(/<script[^>]*src="https?:[^"]*"[^>]*><\/script>/g, '');  // drop the CDN Chart.js
 
 const dom = new JSDOM(html, {
@@ -45,13 +47,14 @@ const load = (rel) => {
   }
 };
 
-/* Take the script list straight from index.html, in order, so adding a module
- * to the app can never silently leave it untested. */
-const scripts = [...fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8')
+/* Take the script list straight from the app document, in order, so adding a
+ * module to the app can never silently leave it untested. The app lives at
+ * /app/ but loads its assets from the site root, so strip either prefix. */
+const scripts = [...fs.readFileSync(APP_HTML, 'utf8')
   .matchAll(/<script[^>]*src="(?!https?:)([^"]+)"/g)]
-  .map((m) => m[1].replace(/^\.\//, ''))
+  .map((m) => m[1].replace(/^\.?\//, ''))
   .filter((f) => !f.startsWith('vendor/'));   // Chart.js is stubbed; jsdom has no canvas
-if (!scripts.includes('js/app.js')) throw new Error('no app scripts found in index.html');
+if (!scripts.includes('js/app.js')) throw new Error('no app scripts found in app/index.html');
 scripts.forEach(load);
 
 (async () => {

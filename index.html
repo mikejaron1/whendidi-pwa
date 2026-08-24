@@ -1,101 +1,257 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
-  <meta name="theme-color" content="#161c30" />
-  <meta name="description" content="Track habits and symptoms, then find which ones actually affect how you feel. Plotline runs real statistics on your own log - private, offline-first, and with every finding explained in plain language." />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="Plotline" />
-  <link rel="manifest" href="manifest.webmanifest" />
-  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png" />
-  <link rel="apple-touch-icon" href="icons/icon-192.png" />
-  <link rel="stylesheet" href="css/styles.css" />
-  <title>Plotline: Track & Find Trends</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Plotline — find what actually affects how you feel</title>
+<meta name="description" content="Plotline is a private habit and symptom tracker that runs real statistics on your own log and tells you, in plain language, which things actually go together." />
+<link rel="canonical" href="https://plotline.day/" />
+<meta name="theme-color" content="#0d1120" />
+<link rel="icon" href="/icons/icon-192.png" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://plotline.day/" />
+<meta property="og:title" content="Plotline — find what actually affects how you feel" />
+<meta property="og:description" content="A private habit and symptom tracker that runs real statistics on your own log." />
+<meta property="og:image" content="https://plotline.day/store/feature-graphic.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<style>
+  :root{
+    --brand:#ff7a2f; --teal:#12b3a6;
+    --ink-top:#232b4a; --ink-bot:#0d1120;
+    --text:#1a2036; --muted:#5b6480; --line:#e3e7f2; --bg-soft:#f4f6fb;
+    --wrap:1080px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    color:var(--text);background:#fff;line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--wrap);margin:0 auto;padding:0 24px}
+  a{color:inherit}
+
+  /* ---- header ---- */
+  header{position:sticky;top:0;z-index:10;background:rgba(13,17,32,.92);
+    backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,.08)}
+  .nav{display:flex;align-items:center;gap:14px;height:64px}
+  .nav img{width:32px;height:32px;border-radius:8px}
+  .nav .name{color:#fff;font-weight:700;letter-spacing:-.4px;font-size:19px}
+  .nav .spacer{flex:1}
+  .nav a{color:#c3cbe6;text-decoration:none;font-size:15px;margin-left:22px}
+  .nav a:hover{color:#fff}
+  @media(max-width:620px){.nav a.hide-sm{display:none}}
+
+  /* ---- hero ---- */
+  .hero{background:radial-gradient(120% 130% at 12% 0%, var(--ink-top) 0%, var(--ink-bot) 62%);
+    color:#fff;padding:88px 0 96px;text-align:center}
+  .hero h1{font-size:clamp(38px,6.2vw,68px);line-height:1.05;letter-spacing:-2px;font-weight:700}
+  .hero h1 .accent{color:var(--brand)}
+  .hero p.lead{margin:22px auto 0;max-width:640px;font-size:clamp(17px,2.2vw,21px);
+    color:#aeb8d8;line-height:1.5}
+  .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:38px}
+  .btn{display:inline-block;padding:15px 30px;border-radius:999px;text-decoration:none;
+    font-weight:600;font-size:17px;transition:transform .12s ease,opacity .12s ease}
+  .btn:hover{transform:translateY(-1px)}
+  .btn-primary{background:var(--brand);color:#fff}
+  .btn-ghost{border:1px solid rgba(255,255,255,.28);color:#fff}
+  .note{margin-top:18px;font-size:14px;color:#7f8ab0}
+
+  /* ---- generic section ---- */
+  section{padding:84px 0}
+  .soft{background:var(--bg-soft);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  h2{font-size:clamp(28px,3.8vw,40px);letter-spacing:-1.1px;line-height:1.15;font-weight:700}
+  .sub{margin-top:14px;color:var(--muted);font-size:18px;max-width:620px}
+  .center{text-align:center}
+  .center .sub{margin-left:auto;margin-right:auto}
+
+  .grid{display:grid;gap:22px;margin-top:44px}
+  .cols-3{grid-template-columns:repeat(3,1fr)}
+  .cols-2{grid-template-columns:repeat(2,1fr)}
+  @media(max-width:820px){.cols-3,.cols-2{grid-template-columns:1fr}}
+  .card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:26px}
+  .card h3{font-size:19px;letter-spacing:-.3px;margin-bottom:8px}
+  .card p{color:var(--muted);font-size:16px}
+  .step{font-variant-numeric:tabular-nums;font-weight:700;color:var(--brand);
+    font-size:14px;letter-spacing:1.4px;text-transform:uppercase;margin-bottom:10px}
+
+  /* ---- finding sample ---- */
+  .finding{background:#fff;border:1px solid var(--line);border-left:4px solid var(--teal);
+    border-radius:12px;padding:20px 22px;margin-top:16px;font-size:17px}
+  .finding .tag{display:inline-block;margin-top:10px;font-size:12px;font-weight:700;
+    letter-spacing:.8px;text-transform:uppercase;background:#e7f7f5;color:#0c7d74;
+    padding:4px 10px;border-radius:999px}
+
+  /* ---- shots ---- */
+  .shots{display:flex;gap:20px;overflow-x:auto;padding:44px 24px 8px;
+    scroll-snap-type:x mandatory;max-width:var(--wrap);margin:0 auto}
+  .shots img{width:250px;flex:0 0 auto;border-radius:20px;border:1px solid var(--line);
+    box-shadow:0 18px 40px rgba(20,28,60,.13);scroll-snap-align:center;background:#fff}
+
+  ul.ticks{margin-top:22px;list-style:none}
+  ul.ticks li{position:relative;padding-left:30px;margin-bottom:12px;color:var(--muted);font-size:17px}
+  ul.ticks li::before{content:"";position:absolute;left:6px;top:9px;width:9px;height:9px;
+    border-radius:50%;background:var(--teal)}
+  ul.ticks li b{color:var(--text);font-weight:600}
+
+  /* ---- footer ---- */
+  footer{background:var(--ink-bot);color:#8892b4;padding:52px 0;font-size:15px}
+  footer a{color:#c3cbe6;text-decoration:none;margin-right:20px}
+  footer a:hover{color:#fff}
+  .foot-row{display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between}
+  .disclaimer{margin-top:26px;font-size:13px;color:#6a7398;max-width:720px;line-height:1.55}
+</style>
 </head>
 <body>
-  <div class="app-shell">
-    <div class="statusbar-pad"></div>
-    <header class="app-header">
-      <button class="icon-btn" id="menuBtn" aria-label="Menu">☰</button>
-      <div class="title" id="appTitle">Plotline<span class="sync-pill" id="syncPill" style="display:none;"></span></div>
-      <button class="icon-btn" id="exportBtn" aria-label="Export" title="Export JSON">⬇</button>
-      <button class="icon-btn" id="addBtn" aria-label="Add event">＋</button>
-    </header>
 
-    <nav class="app-tabs" id="tabs" role="tablist">
-      <button class="tab" role="tab" data-view="categories" aria-selected="true">Categories</button>
-      <button class="tab" role="tab" data-view="recent"     aria-selected="false">Recent</button>
-      <button class="tab" role="tab" data-view="day"        aria-selected="false">Day</button>
-      <button class="tab" role="tab" data-view="stats"      aria-selected="false">Statistics</button>
-      <button class="tab" role="tab" data-view="insights"   aria-selected="false">Insights</button>
-    </nav>
-
-    <main class="app-main" id="main" aria-live="polite">
-      <!-- views injected here -->
-    </main>
-
-    <button class="fab" id="fab" aria-label="Add event">＋</button>
+<header>
+  <div class="wrap nav">
+    <img src="/icons/icon-192.png" alt="" />
+    <span class="name">Plotline</span>
+    <span class="spacer"></span>
+    <a class="hide-sm" href="#how">How it works</a>
+    <a class="hide-sm" href="#insights">Insights</a>
+    <a class="hide-sm" href="#privacy">Privacy</a>
+    <a href="/app/">Open app</a>
   </div>
+</header>
 
-  <!-- Drawer -->
-  <div class="drawer" id="drawer" aria-hidden="true">
-    <div class="scrim" data-close></div>
-    <aside class="panel" role="navigation">
-      <header>
-        <div class="app-name">Plotline</div>
-        <div class="app-sub">Count what happens, know when</div>
-      </header>
-      <nav>
-        <div class="section">Data</div>
-        <button id="navImport">📥 Import JSON…</button>
-        <button id="navExport">💾 Export JSON</button>
-        <button id="navExportCsv">📊 Export CSV (for Sheets/Excel)</button>
-        <button id="navBackup">🛟 Save safety backup</button>
-        <div class="section">Setup</div>
-        <button id="navTopics">🗂 Manage topics</button>
-        <button id="navQuickBar">⚡ Quick-access bar…</button>
-        <button id="navRoles">🩺 Insights setup…</button>
-        <button id="navAlerts">🔔 Status alerts…</button>
-        <button id="navDrive">☁️ Google Drive sync…</button>
-        <div class="section">App</div>
-        <button id="navAbout">ℹ️ About</button>
-        <button id="navStorage">💽 Storage status</button>
-        <a class="drawer-link" href="privacy.html" target="_blank" rel="noopener">🔒 Privacy policy</a>
-        <div class="section">Danger zone</div>
-        <button id="navWipe" class="danger">🗑 Wipe all local data…</button>
-      </nav>
-      <div class="drawer-version" id="drawerVersion">—</div>
-    </aside>
+<div class="hero">
+  <div class="wrap">
+    <h1>Most trackers count.<br /><span class="accent">Plotline explains.</span></h1>
+    <p class="lead">
+      Log a headache, a coffee, a workout, a bad night's sleep — one tap each.
+      Plotline runs real statistics across your history and tells you which
+      things actually go together.
+    </p>
+    <div class="cta">
+      <a class="btn btn-primary" href="/app/">Open the web app</a>
+      <a class="btn btn-ghost" href="#insights">See how it works</a>
+    </div>
+    <p class="note">Free · No account · Works offline · Android app coming soon</p>
   </div>
+</div>
 
-  <!-- Modal container -->
-  <div id="modalRoot"></div>
+<section id="how" class="center">
+  <div class="wrap">
+    <h2>Three steps, then it does the work</h2>
+    <p class="sub">Setup takes about a minute. The analysis runs by itself from then on.</p>
+    <div class="grid cols-3" style="text-align:left">
+      <div class="card">
+        <div class="step">Step 1</div>
+        <h3>Pick what you track</h3>
+        <p>Start from a preset — symptoms, daily habits, fitness — or build your
+        own. Counts, amounts, durations, or a 0–5 severity rating.</p>
+      </div>
+      <div class="card">
+        <div class="step">Step 2</div>
+        <h3>Tap as it happens</h3>
+        <p>One tap logs the moment. Add a note or a #tag if you want. Forgot in
+        the moment? Backdate it later.</p>
+      </div>
+      <div class="card">
+        <div class="step">Step 3</div>
+        <h3>Read the findings</h3>
+        <p>Say which topics are outcomes and which might influence them.
+        Plotline handles the statistics and writes up what it finds.</p>
+      </div>
+    </div>
+  </div>
+</section>
 
-  <!-- Snackbar -->
-  <div class="snackbar" id="snackbar" role="status"></div>
+<section id="insights" class="soft">
+  <div class="wrap">
+    <h2>Statistics are easy to do badly</h2>
+    <p class="sub">
+      Most apps hand you a chart and let you draw your own conclusions — which
+      is how people end up certain about things that never happened. Plotline is
+      built to tell you when a pattern is real, and when it isn't.
+    </p>
 
-  <!-- Hidden file input for import -->
-  <input type="file" id="fileInput" accept="application/json,.json" hidden />
+    <div class="finding">
+      “You logged coffee after 4pm on 12 days, and slept 47 minutes less on
+      those nights.”
+      <br /><span class="tag">Significant · q &lt; 0.05</span>
+    </div>
 
-  <!-- Scripts -->
-  <script src="vendor/chart.umd.min.js"></script>
-  <script src="js/config.js"></script>
-  <script src="js/db.js"></script>
-  <script src="js/import-export.js"></script>
-  <script src="js/stats.js"></script>
-  <script src="js/insights.js"></script>
-  <script src="js/goals.js"></script>
-  <script src="js/drive.js"></script>
-  <script src="js/app.js"></script>
-  <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js').catch(console.error);
-      });
-    }
-  </script>
+    <ul class="ticks">
+      <li><b>Every influence is tested against every outcome</b>, so you don't
+      have to guess which pair to look at.</li>
+      <li><b>Corrected for multiple comparisons</b> using Benjamini–Hochberg
+      false-discovery control. Test enough pairs and something always looks
+      striking by chance; this is what stops that.</li>
+      <li><b>Confirmed two ways.</b> A finding is only called significant if it
+      survives both a parametric and a rank-based test.</li>
+      <li><b>Timing effects too</b> — whether something in the evening changes
+      the next day, not just the same one.</li>
+      <li><b>Written in plain English</b>, using your own topic names, with the
+      numbers shown so you can judge them yourself.</li>
+    </ul>
+  </div>
+</section>
+
+<div class="shots">
+  <img src="/store/screenshots/03-insights.png" width="1080" height="1920" loading="lazy" alt="Insights view showing a summary of the last seven days against a ninety-day baseline" />
+  <img src="/store/screenshots/04-findings.png" width="1080" height="1920" loading="lazy" alt="A list of statistical findings written in plain language" />
+  <img src="/store/screenshots/01-categories.png" width="1080" height="1920" loading="lazy" alt="Topic cards showing time since last and one-tap add buttons" />
+  <img src="/store/screenshots/02-statistics.png" width="1080" height="1920" loading="lazy" alt="Per-topic statistics and charts" />
+  <img src="/store/screenshots/06-recent.png" width="1080" height="1920" loading="lazy" alt="Recent entries with goals and streaks" />
+</div>
+
+<section id="privacy" class="center">
+  <div class="wrap">
+    <h2>Your data never leaves your phone</h2>
+    <p class="sub">
+      This isn't a policy promise with a loophole. There is no server to send
+      anything to. The analysis runs on your device.
+    </p>
+    <div class="grid cols-2" style="text-align:left">
+      <div class="card">
+        <h3>No account, no sign-up</h3>
+        <p>Open it and start. Nothing to register, nothing to verify, no email
+        required.</p>
+      </div>
+      <div class="card">
+        <h3>No ads, no trackers</h3>
+        <p>No analytics of any kind — not even the anonymous sort. Nothing is
+        measured about you.</p>
+      </div>
+      <div class="card">
+        <h3>Backups you control</h3>
+        <p>Export the whole history to JSON whenever you like, or sync to
+        <em>your own</em> Google Drive. Optional, and off by default.</p>
+      </div>
+      <div class="card">
+        <h3>Open source</h3>
+        <p>The entire app is public. You don't have to take any of this on
+        trust — you can go and read it.</p>
+      </div>
+    </div>
+    <div class="cta">
+      <a class="btn btn-primary" href="/app/">Open the web app</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-row">
+      <div>
+        <a href="/app/">Open app</a>
+        <a href="/privacy.html">Privacy</a>
+        <a href="https://github.com/mikejaron1/countwhen">Source</a>
+        <a href="mailto:hello@plotline.day">Contact</a>
+      </div>
+      <div>© 2026 Plotline</div>
+    </div>
+    <p class="disclaimer">
+      Plotline is a personal record-keeping tool. It is not a medical device,
+      and it does not diagnose, treat, or provide medical advice. Correlation
+      is not causation — a finding is a place to start a conversation with a
+      clinician, not a conclusion. Talk to one about health decisions.
+    </p>
+  </div>
+</footer>
+
 </body>
 </html>

@@ -3,26 +3,27 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'v7.6.2';
+const CACHE_VERSION = 'v7.7.0';
 
 const SHELL = [
-  './',
-  './index.html',
-  './privacy.html',
-  './manifest.webmanifest',
-  './css/styles.css',
-  './js/config.js',
-  './js/db.js',
-  './js/import-export.js',
-  './js/stats.js',
-  './js/insights.js',
-  './js/goals.js',
-  './js/drive.js',
-  './js/app.js',
-  './vendor/chart.umd.min.js',
-  './icons/icon-192.png',
-  './icons/icon-512.png',
-  './icons/icon-maskable.png',
+  '/',
+  '/app/',
+  '/app/index.html',
+  '/privacy.html',
+  '/manifest.webmanifest',
+  '/css/styles.css',
+  '/js/config.js',
+  '/js/db.js',
+  '/js/import-export.js',
+  '/js/stats.js',
+  '/js/insights.js',
+  '/js/goals.js',
+  '/js/drive.js',
+  '/js/app.js',
+  '/vendor/chart.umd.min.js',
+  '/icons/icon-192.png',
+  '/icons/icon-512.png',
+  '/icons/icon-maskable.png',
 ];
 
 self.addEventListener('install', (event) => {

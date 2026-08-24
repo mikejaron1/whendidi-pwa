@@ -308,3 +308,44 @@ native. It is on-device, needs no server, keeps the privacy promise intact,
 and covers sleep, steps and heart rate — the inputs the correlation engine
 would benefit from most. Treat Strava and Garmin as a separate, later
 decision, weighed against the cost of running a server at all.
+
+---
+
+## 8. Marketing site at the root, app at `/app/`
+
+**Decision:** `plotline.day/` is a marketing page; the app moved to
+`plotline.day/app/`.
+
+**Why:** the root used to serve the PWA itself, which is what GitHub Pages
+does by default with this repo. That is a poor landing page for a product
+about to be listed on Play — the listing links to the site, and a visitor
+who lands in a bare app with no explanation has nothing to convert on. It
+is also a weak answer to Google's OAuth requirement that the homepage
+"must describe your app's functionality to its users" and "can not be only
+a login page". A marketing page is additionally where pricing has to live
+if the freemium plan in §2 ever happens.
+
+**The one dangerous part: `id`.** The web app manifest `id` is left at `/`
+even though `start_url` and `scope` are now `/app/`. `id` is an opaque
+same-origin identifier and is not required to match either. Repointing it
+at `/app/` would make Chrome treat this as a *different* application:
+existing installs would be orphaned on the old identity, exactly the class
+of failure §6 already caused once with IndexedDB. Do not "tidy" this.
+
+**Why this move is safe where the domain move was not:** IndexedDB is
+scoped to origin, not path. `plotline.day/` and `plotline.day/app/` are
+the same origin, so all existing data carries over untouched. The §6
+migration changed the origin, which is why it destroyed access.
+
+**What had to move with it:**
+
+- Asset references in `app/index.html` are now root-absolute; the assets
+  themselves did not move.
+- `sw.js` stays at the root, so its scope still covers the whole site. Its
+  shell list is now absolute and includes both `/` and `/app/`.
+- The service worker registration is `/sw.js`, not `sw.js`, which would
+  otherwise resolve to a non-existent `/app/sw.js`.
+- `ui-smoke.js` reads `app/index.html`, and normalises a leading `/` as
+  well as `./` when extracting the script list.
+- `.well-known/assetlinks.json` stays at the root. It is tied to the
+  domain, not to where the app is served from.

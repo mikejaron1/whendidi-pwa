@@ -46,6 +46,16 @@ No drag-and-drop, no console clicks. Pages handles the rest.
 
 ### Hosting notes
 
+**Site layout.** The root is a marketing page; the app is served from
+`/app/`. Assets (`js/`, `css/`, `icons/`, `vendor/`) stay at the root and
+`app/index.html` references them with absolute paths. `sw.js` also stays at
+the root so its scope covers the whole site, and is registered as `/sw.js`.
+
+The manifest `id` is deliberately `/` while `start_url` and `scope` are
+`/app/`. Changing `id` would orphan every existing PWA install. See
+DECISIONS.md section 8.
+
+
 The site is served from the custom domain **`plotline.day`**, so this repo
 publishes at the *domain root* rather than under a `/countwhen/` path.
 
@@ -278,7 +288,7 @@ exists only so the tests can run.
   today, clamping, weekly aggregation and the day cutoff.
 - `drive-smoke.js` runs `js/drive.js` against an in-memory fake of the
   Drive v3 API, so it needs no credentials and touches no real files.
-- `ui-smoke.js` loads the real `index.html` and app scripts in jsdom
+- `ui-smoke.js` loads the real `app/index.html` and app scripts in jsdom
   against a fake IndexedDB and renders every tab, so a runtime error
   fails there rather than on your phone.
 

@@ -3,8 +3,8 @@
   "name": "Plotline: Track & Find Trends",
   "short_name": "Plotline",
   "description": "Track habits and symptoms, then find which ones actually affect how you feel.",
-  "start_url": "./index.html",
-  "scope": "./",
+  "start_url": "/app/",
+  "scope": "/app/",
   "display": "standalone",
   "display_override": [
     "standalone",
@@ -23,19 +23,19 @@
   "theme_color": "#161c30",
   "icons": [
     {
-      "src": "icons/icon-192.png",
+      "src": "/icons/icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "icons/icon-512.png",
+      "src": "/icons/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "icons/icon-maskable.png",
+      "src": "/icons/icon-maskable.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"

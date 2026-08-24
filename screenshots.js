@@ -173,7 +173,7 @@ async function main() {
   const page = await ctx.newPage();
   page.on('pageerror', (e) => console.error('  page error:', e.message));
 
-  await page.goto(`http://localhost:${PORT}/index.html`, { waitUntil: 'load' });
+  await page.goto(`http://localhost:${PORT}/app/index.html`, { waitUntil: 'load' });
   await page.waitForFunction(() => !!window.CWDB);
 
   const data = buildDemoData();
