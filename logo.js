@@ -121,6 +121,41 @@ html,body{margin:0;padding:0;width:${w}px;height:${h}px;overflow:hidden}
 svg{display:block;width:${w}px;height:${h}px}
 </style></head><body>${svg}</body></html>`.trim();
 
+/* Browsers request /favicon.ico by default, and Chrome caches favicons far
+ * more aggressively than ordinary images — a <link> change alone will not
+ * dislodge one it has already stored for an origin. Shipping a real .ico at
+ * the conventional path, alongside version-stamped <link> URLs, is what
+ * actually forces a refresh.
+ *
+ * ICO is a directory of images; embedding PNGs is supported by every browser
+ * in use. Header is 6 bytes, then one 16-byte entry per image, then the data.
+ * A stored dimension of 0 means 256. */
+function writeIco(entries, out) {
+  const imgs = entries.map((e) => ({ size: e.size, buf: fs.readFileSync(e.path) }));
+  const header = Buffer.alloc(6);
+  header.writeUInt16LE(0, 0);          // reserved
+  header.writeUInt16LE(1, 2);          // type: icon
+  header.writeUInt16LE(imgs.length, 4);
+  const dir = Buffer.alloc(16 * imgs.length);
+  let offset = header.length + dir.length;
+  imgs.forEach((im, i) => {
+    const o = i * 16;
+    const dim = im.size >= 256 ? 0 : im.size;
+    dir.writeUInt8(dim, o);            // width
+    dir.writeUInt8(dim, o + 1);        // height
+    dir.writeUInt8(0, o + 2);          // palette size (0 = truecolour)
+    dir.writeUInt8(0, o + 3);          // reserved
+    dir.writeUInt16LE(1, o + 4);       // colour planes
+    dir.writeUInt16LE(32, o + 6);      // bits per pixel
+    dir.writeUInt32LE(im.buf.length, o + 8);
+    dir.writeUInt32LE(offset, o + 12);
+    offset += im.buf.length;
+  });
+  fs.writeFileSync(out, Buffer.concat([header, dir, ...imgs.map((i) => i.buf)]));
+  const kb = (fs.statSync(out).size / 1024).toFixed(1);
+  console.log(`  wrote ${path.relative(ROOT, out)}  ${imgs.map((i) => i.size).join('/')}  ${kb} KB`);
+}
+
 (async () => {
   fs.mkdirSync(ICONS, { recursive: true });
   fs.mkdirSync(STORE, { recursive: true });
@@ -150,6 +185,16 @@ svg{display:block;width:${w}px;height:${h}px}
               path.join(STORE, 'icon-512.png'));
 
   await shoot(page, featureGraphic(), 1024, 500, path.join(STORE, 'feature-graphic.png'));
+
+  /* Favicons: full bleed, because a rounded mark loses most of its pixels to
+   * transparent corners at 16px. */
+  const favEntries = [];
+  for (const s of [16, 32, 48]) {
+    const p = path.join(ICONS, `favicon-${s}.png`);
+    await shoot(page, wrapSvg(mark({ bleed: true }), s, s), s, s, p);
+    favEntries.push({ size: s, path: p });
+  }
+  writeIco(favEntries, path.join(ROOT, 'favicon.ico'));
 
   await browser.close();
   console.log('\ndone.');

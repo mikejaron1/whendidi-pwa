@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'v7.7.0';
+const CACHE_VERSION = 'v7.7.1';
 
 const SHELL = [
   '/',
@@ -21,6 +21,7 @@ const SHELL = [
   '/js/drive.js',
   '/js/app.js',
   '/vendor/chart.umd.min.js',
+  '/favicon.ico',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
   '/icons/icon-maskable.png',
