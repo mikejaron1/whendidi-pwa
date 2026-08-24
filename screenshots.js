@@ -2,8 +2,12 @@
  *
  * Runs the real app in Chrome against a temporary local server, seeds a
  * synthetic 100-day dataset through the app's own CWDB API, then captures
- * each view at 1080x1920 (Play's recommended phone size; its limit is a
- * 2:1 aspect ratio, which most phone captures exceed).
+ * each view at 1080x1920 (Play's recommended phone size). Play requires every
+ * side to fall in 320..3840px with the long side at most 2x the short one, so
+ * a native capture from a tall modern phone (20:9) would be rejected on ratio.
+ *
+ * Captured assets are checked against those rules before this script exits;
+ * otherwise a violation only surfaces as an upload error in the Console.
  *
  * Your own data is never touched: Chrome runs in a throwaway profile with
  * its own IndexedDB.
@@ -18,6 +22,12 @@ const { chromium } = require('playwright');
 const ROOT = __dirname;
 const OUT = path.join(ROOT, 'store', 'screenshots');
 const PORT = 8791;
+
+/* Play's recommended phone screenshot size, and comfortably inside its
+ * 320..3840px per-side bounds. Every emitted asset lands on exactly this. */
+const SHOT_W = 1080;
+const SHOT_H = 1920;
+const SHOT_SCALE = 3;
 
 /* ---------- deterministic RNG so re-runs produce identical images ------- */
 function mulberry32(seed) {
@@ -163,8 +173,8 @@ async function main() {
   const server = await serve();
   const browser = await chromium.launch({ channel: 'chrome' });
   const ctx = await browser.newContext({
-    viewport: { width: 360, height: 640 },
-    deviceScaleFactor: 3,            // 360x640 @3 => 1080x1920 exactly
+    viewport: { width: SHOT_W / SHOT_SCALE, height: SHOT_H / SHOT_SCALE },
+    deviceScaleFactor: SHOT_SCALE,   // 360x640 @3 => 1080x1920 exactly
     isMobile: true,
     hasTouch: true,
     serviceWorkers: 'block',
@@ -239,10 +249,50 @@ async function main() {
   await page.screenshot({ path: path.join(OUT, '04-findings.png') });
   console.log('  04-findings.png');
 
-  await frameShots(page);
+  await frameShots(browser);
 
   await browser.close();
   server.close();
+
+  verifyPlayAssets();
+}
+
+/* ---------- Play asset compliance --------------------------------------- */
+/* Play rejects screenshots outside its bounds, and the failure surfaces only
+ * at upload time. Reading the PNG header here turns that into a build error.
+ * Requirements (support.google.com/googleplay/android-developer/answer/9866151):
+ * 24-bit PNG with no alpha, every side 320..3840, long side <= 2x short side. */
+function pngHeader(file) {
+  const d = fs.readFileSync(file);
+  return {
+    width: d.readUInt32BE(16),
+    height: d.readUInt32BE(20),
+    colorType: d.readUInt8(25),
+  };
+}
+
+function verifyPlayAssets() {
+  const shots = [
+    ...fs.readdirSync(OUT).filter((f) => f.endsWith('.png')).map((f) => path.join(OUT, f)),
+    ...fs.readdirSync(path.join(OUT, 'framed')).map((f) => path.join(OUT, 'framed', f)),
+  ];
+  const bad = [];
+  for (const file of shots) {
+    const { width, height, colorType } = pngHeader(file);
+    const long = Math.max(width, height);
+    const short = Math.min(width, height);
+    const rel = path.relative(OUT, file);
+    if (colorType !== 2) bad.push(`${rel}: needs 24-bit RGB with no alpha (colorType=${colorType})`);
+    if (short < 320) bad.push(`${rel}: ${short}px side is under Play's 320px minimum`);
+    if (long > 3840) bad.push(`${rel}: ${long}px side exceeds Play's 3840px maximum`);
+    if (long > short * 2) bad.push(`${rel}: ${long}x${short} is more than 2:1`);
+  }
+  if (bad.length) {
+    console.error('\nPlay would reject these assets:');
+    bad.forEach((b) => console.error('  ' + b));
+    process.exit(1);
+  }
+  console.log(`\n  ${shots.length} screenshots pass Play's size rules`);
 }
 
 /* ---------- captioned store frames -------------------------------------- */
@@ -267,15 +317,26 @@ const FRAMES = [
                     'No account, no server, no ads. Works fully offline.'],
 ];
 
-async function frameShots(page) {
+/* The frame markup is authored in 1080x1920 CSS pixels, so it needs its own
+ * context at deviceScaleFactor 1. Reusing the capture page would inherit that
+ * context's scale factor of 3 and emit 3240x5760 - past Play's 3840px cap. */
+async function frameShots(browser) {
   const outDir = path.join(OUT, 'framed');
   fs.mkdirSync(outDir, { recursive: true });
+
+  const ctx = await browser.newContext({
+    viewport: { width: SHOT_W, height: SHOT_H },
+    deviceScaleFactor: 1,
+    serviceWorkers: 'block',
+    colorScheme: 'light',
+  });
+  const page = await ctx.newPage();
 
   for (const [src, headline, sub] of FRAMES) {
     const b64 = fs.readFileSync(path.join(OUT, `${src}.png`)).toString('base64');
     const html = `<!doctype html><meta charset="utf-8"><style>
       *{margin:0;padding:0;box-sizing:border-box}
-      body{width:1080px;height:1920px;overflow:hidden;color:#fff;
+      body{width:${SHOT_W}px;height:${SHOT_H}px;overflow:hidden;color:#fff;
         background:radial-gradient(120% 130% at 10% 6%, #2b3459 0%, ${INK_BOT} 60%);
         font-family:-apple-system,"Helvetica Neue",Helvetica,Arial,sans-serif}
       .copy{padding:104px 84px 0}
@@ -293,13 +354,13 @@ async function frameShots(page) {
     <div class="copy"><h1>${headline}</h1><p>${sub}</p><div class="rule"></div></div>
     <div class="device"><img src="data:image/png;base64,${b64}"></div>`;
 
-    await page.setViewportSize({ width: 1080, height: 1920 });
     await page.setContent(html, { waitUntil: 'load' });
     await page.waitForTimeout(250);
     const name = `f${FRAMES.findIndex((f) => f[0] === src) + 1}-${src.slice(3)}.png`;
     await page.screenshot({ path: path.join(outDir, name) });
     console.log(`  framed/${name}`);
   }
+  await ctx.close();
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
