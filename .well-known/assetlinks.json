@@ -5,7 +5,8 @@
       "namespace": "android_app",
       "package_name": "day.plotline.app",
       "sha256_cert_fingerprints": [
-        "7C:91:A1:74:3A:D3:45:D9:20:74:77:83:9B:E7:77:D2:D5:40:5A:AC:3D:1E:16:40:C9:D1:6D:8E:66:BC:CE:92"
+        "7C:91:A1:74:3A:D3:45:D9:20:74:77:83:9B:E7:77:D2:D5:40:5A:AC:3D:1E:16:40:C9:D1:6D:8E:66:BC:CE:92",
+        "45:46:0C:3F:80:D5:24:45:44:52:AE:5C:93:A9:DA:C8:1B:91:58:1C:78:10:5A:A6:65:EE:A2:4C:F7:82:B9:12"
       ]
     }
   }
