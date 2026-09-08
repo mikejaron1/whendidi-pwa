@@ -12,10 +12,7 @@ const APP_META_TOP_KEY = '_plotline';
 const LEGACY_APP_META_TOP_KEYS = ['_countwhen', '_wdapp'];
 
 const readAppMeta = (obj) => {
-  if (!obj) return undefined;
-  if (obj[APP_META_TOP_KEY]) return obj[APP_META_TOP_KEY];
-  for (const k of LEGACY_APP_META_TOP_KEYS) if (obj[k]) return obj[k];
-  return undefined;
+  return [APP_META_TOP_KEY, ...LEGACY_APP_META_TOP_KEYS].reduce((app, key) => existingWins(app, obj?.[key] || {}), {});
 };
 
 const KNOWN_TOP_KEYS = new Set([
@@ -30,28 +27,50 @@ const KNOWN_TOP_KEYS = new Set([
  * the quick-access bar. Readers that don't know the key ignore it. */
 const APP_META_KEYS = [
   'topicKinds', 'topicMeta', 'topicOrder', 'quickBar',
-  'topicRoles', 'insightSettings',
+  'topicRoles', 'insightSettings', 'topicGoals', 'topicPrefs', 'dayChecks',
 ];
 
-async function buildAppMeta() {
-  const out = {};
+/* Schema 1 adds portable goals, topicPrefs {quickAmount, aggregation:
+ * sum|mean|latest, trackingStart: epoch ms}, and dayChecks
+ * {YYYY-MM-DD: complete|none|incomplete}. Unknown JSON fields and newer
+ * positive schema versions survive; known fields still require safe shapes.
+ * Runtime/device metadata never travels, even inside legacy namespaces. */
+const BACKUP_SCHEMA_VERSION = 1;
+const TOPIC_MAP_KEYS = ['topicKinds', 'topicMeta', 'topicRoles', 'topicGoals', 'topicPrefs'];
+const LOCAL_META_KEYS = new Set([
+  ...CWDB.DEVICE_META_KEYS, 'activeTimers', 'lastImport', 'lastExport',
+  'lastAlertAt', 'lastAlertLevel', 'originalVersion', 'extraTopKeys', 'extraAppMeta',
+  'identity', 'counters', 'syncState', 'localState', 'deviceIdentity',
+  'deviceCounter', 'changeCounter', 'syncMetadata', 'syncTombstones',
+  'accessToken', 'refreshToken', 'idToken',
+]);
+const isLocalKey = (key) => LOCAL_META_KEYS.has(key);
+const portable = (obj) => Object.fromEntries(Object.entries(obj || {}).filter(([key]) => !isLocalKey(key)));
+
+async function buildAppMeta(dataset) {
+  const records = dataset ? dataset.meta : await CWDB.getAll('meta');
+  const meta = Object.fromEntries(records.map((r) => [r.key, r.value]));
+  const out = { ...portable(meta.extraAppMeta), backupSchemaVersion: meta.backupSchemaVersion ?? BACKUP_SCHEMA_VERSION };
   for (const k of APP_META_KEYS) {
-    const v = await CWDB.getMeta(k);
-    if (v != null) out[k] = v;
+    const v = meta[k];
+    if (v != null) out[k] = k === 'insightSettings' ? portable(v) : v;
   }
-  const favs = await CWDB.getAll('favorites');
+  const favs = dataset ? dataset.favorites : await CWDB.getAll('favorites');
   if (favs.length) out.favorites = favs;
   return out;
 }
 
 async function applyAppMeta(app) {
-  if (!app || typeof app !== 'object') return;
-  for (const k of APP_META_KEYS) {
-    if (app[k] != null) await CWDB.setMeta(k, app[k]);
-  }
-  if (Array.isArray(app.favorites) && app.favorites.length) {
-    await CWDB.putMany('favorites', app.favorites);
-  }
+  return CWDB.updateDataset((dataset) => {
+    assertValid({ topics: dataset.topics, events: dataset.events, measurements: dataset.measurements, [APP_META_TOP_KEY]: app });
+    const meta = new Map(dataset.meta.map((r) => [r.key, r.value]));
+    if (app.backupSchemaVersion != null) meta.set('backupSchemaVersion', Math.max(meta.get('backupSchemaVersion') || BACKUP_SCHEMA_VERSION, app.backupSchemaVersion));
+    for (const k of APP_META_KEYS) if (app[k] != null) meta.set(k, k === 'insightSettings' ? portable(app[k]) : app[k]);
+    meta.set('extraAppMeta', { ...meta.get('extraAppMeta'), ...unknownAppFields(app) });
+    dataset.meta = Array.from(meta, ([key, value]) => ({ key, value }));
+    if (app.favorites) dataset.favorites = app.favorites;
+    return dataset;
+  });
 }
 
 function formatSavedDate(d) {
@@ -62,27 +81,184 @@ function formatSavedDate(d) {
 
 function validateBackup(obj) {
   const errors = [];
-  if (!obj || typeof obj !== 'object') {
-    errors.push('File is not a JSON object.');
-    return errors;
+  const fail = (path, message) => { if (errors.length < 100) errors.push(`${path}: ${message}`); };
+  const record = (v) => !!v && typeof v === 'object' && !Array.isArray(v) && Object.prototype.toString.call(v) === '[object Object]';
+  const id = Number.isSafeInteger;
+  const finite = (v) => typeof v === 'number' && Number.isFinite(v);
+  const epoch = (v) => id(v) && Math.abs(v) <= 8640000000000000;
+  const dateKey = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v) && Number.isFinite(Date.parse(v)) && new Date(v).toISOString().slice(0, 10) === v;
+  if (!record(obj)) return ['File is not a JSON object.'];
+  // Bound nesting, individual strings and total work without limiting years.
+  let nodes = 0;
+  const ancestors = new Set();
+  const json = (value, depth = 0) => {
+    if (++nodes > 20000000 || depth > 32) throw new Error('Backup exceeds size/nesting limits.');
+    if (value === null || typeof value === 'boolean') return;
+    if (typeof value === 'number' && finite(value)) return;
+    if (typeof value === 'string' && value.length <= 1000000) return;
+    if (typeof value !== 'object' || (!Array.isArray(value) && !record(value)) || ancestors.has(value)) throw new Error('Backup must contain finite, acyclic JSON values (strings up to 1 MB).');
+    ancestors.add(value);
+    for (const child of Object.values(value)) json(child, depth + 1);
+    ancestors.delete(value);
+  };
+  try { json(obj); } catch (error) { return [error.message]; }
+  if (Object.hasOwn(obj, 'version') && !((id(obj.version) && obj.version >= 0) || (typeof obj.version === 'string' && obj.version.length > 0))) fail('version', 'must be a version number or string');
+  if (Object.hasOwn(obj, 'saveddatelong') && !epoch(obj.saveddatelong)) fail('saveddatelong', 'invalid timestamp');
+  if (Object.hasOwn(obj, 'saveddate') && typeof obj.saveddate !== 'string') fail('saveddate', 'must be a string');
+  for (const key of ['eventcount', 'topiccount']) {
+    if (Object.hasOwn(obj, key) && (!id(obj[key]) || obj[key] < 0)) fail(key, 'must be a nonnegative safe integer');
   }
-  for (const k of REQUIRED_KEYS) {
-    if (!Array.isArray(obj[k])) errors.push(`Missing or invalid "${k}" array.`);
+  const tables = {};
+  for (const name of ['topics', 'events', 'measurements', 'pendtimes', 'appdata']) {
+    if (!Object.hasOwn(obj, name) && !REQUIRED_KEYS.includes(name)) continue;
+    const rows = obj[name];
+    if (!Array.isArray(rows)) { fail(name, 'must be an array'); continue; }
+    if (rows.length > (name === 'events' ? 1000000 : 100000)) { fail(name, 'too many records'); continue; }
+    const seen = new Set();
+    tables[name] = seen;
+    rows.forEach((row, i) => {
+      const path = `${name}[${i}]`;
+      if (!record(row)) { fail(path, 'must be an object'); return; }
+      const key = name === 'appdata' ? 'name' : 'id';
+      if (key === 'name' ? typeof row[key] !== 'string' : !id(row[key])) fail(`${path}.${key}`, 'invalid key');
+      if (seen.has(row[key])) fail(`${path}.${key}`, 'duplicate key');
+      seen.add(row[key]);
+      for (const field of ['name', 'desc', 'symbol', 'title', 'note']) {
+        if (Object.hasOwn(row, field) && row[field] !== null && typeof row[field] !== 'string') fail(`${path}.${field}`, 'must be a string or null');
+      }
+      if (name === 'topics' || name === 'measurements') {
+        if (typeof row.name !== 'string') fail(`${path}.name`, 'must be a string');
+      }
+      for (const field of ['qant', 'cost', 'type', 'format', 'optype', 'endtime']) {
+        if (Object.hasOwn(row, field) && !finite(row[field])) fail(`${path}.${field}`, 'must be finite numeric data');
+      }
+      if (name === 'events') {
+        if (!epoch(row.time)) fail(`${path}.time`, 'must be safe integer milliseconds within Date range');
+        if (!id(row.topicid)) fail(`${path}.topicid`, 'must be a safe integer');
+      }
+      if (name === 'topics' && !id(row.msureid)) fail(`${path}.msureid`, 'must be a safe integer');
+      if (name === 'topics' && Object.hasOwn(row, 'archived') && typeof row.archived !== 'boolean') fail(`${path}.archived`, 'must be boolean');
+    });
   }
-  if (Array.isArray(obj.topics)) {
-    for (const [i, t] of obj.topics.entries()) {
-      if (typeof t.id !== 'number') errors.push(`topics[${i}].id missing/non-numeric`);
-      if (typeof t.name !== 'string') errors.push(`topics[${i}].name missing/non-string`);
+  const topics = tables.topics || new Set();
+  const measurements = tables.measurements || new Set(window.CWDB_DEFAULT_MEASUREMENTS.map((m) => m.id));
+  for (const [i, row] of (Array.isArray(obj.topics) ? obj.topics : []).entries()) {
+    if (record(row) && !measurements.has(row.msureid)) fail(`topics[${i}].msureid`, 'unknown measurement');
+  }
+  for (const [i, row] of (Array.isArray(obj.events) ? obj.events : []).entries()) {
+    if (!record(row)) continue;
+    if (!topics.has(row.topicid)) fail(`events[${i}].topicid`, 'unknown topic');
+    if (Object.hasOwn(row, 'msureid') && (!id(row.msureid) || !measurements.has(row.msureid))) fail(`events[${i}].msureid`, 'unknown measurement');
+  }
+  for (const namespace of [APP_META_TOP_KEY, ...LEGACY_APP_META_TOP_KEYS]) {
+    if (!Object.hasOwn(obj, namespace)) continue;
+    const app = obj[namespace];
+    if (!record(app)) { fail(namespace, 'must be an object'); continue; }
+    if (Object.hasOwn(app, 'backupSchemaVersion') && (!id(app.backupSchemaVersion) || app.backupSchemaVersion < 1)) fail(namespace, 'backupSchemaVersion must be a positive safe integer');
+    for (const key of TOPIC_MAP_KEYS) {
+      if (!Object.hasOwn(app, key)) continue;
+      if (!record(app[key])) { fail(`${namespace}.${key}`, 'must be a topic-id map'); continue; }
+      for (const [tid, value] of Object.entries(app[key])) {
+        const path = `${namespace}.${key}.${tid}`;
+        if (!id(Number(tid)) || String(Number(tid)) !== tid || !topics.has(Number(tid))) fail(path, 'unknown topic id');
+        if (value === null) continue; // explicit legacy "unset"
+        if (key === 'topicKinds') {
+          if (!['timeonly', 'duration', 'amount'].includes(value)) fail(path, 'invalid topic kind');
+          continue;
+        }
+        if (key === 'topicRoles' && typeof value === 'string') {
+          if (!['focus', 'marker', 'influence', 'bathroom', 'blood', 'accident', 'meal', 'sleep', 'med', 'trigger'].includes(value)) fail(path, 'invalid role');
+          continue;
+        }
+        if (!record(value)) { fail(path, 'must be an object or null'); continue; }
+        const optional = (field, check) => { if (Object.hasOwn(value, field) && !check(value[field])) fail(`${path}.${field}`, 'invalid value'); };
+        if (key === 'topicPrefs') {
+          optional('quickAmount', finite);
+          optional('aggregation', (v) => ['sum', 'mean', 'latest'].includes(v));
+          optional('trackingStart', epoch);
+        } else if (key === 'topicGoals') {
+          if (!finite(value.target) || value.target < 0) fail(path, 'invalid goal target');
+          optional('metric', (v) => ['count', 'minutes', 'amount'].includes(v));
+          optional('cmp', (v) => ['gte', 'lte'].includes(v));
+          optional('period', (v) => ['day', 'week'].includes(v));
+          optional('since', epoch);
+          optional('effectiveFrom', epoch);
+          optional('paused', (v) => typeof v === 'boolean');
+          optional('history', (history) => Array.isArray(history) && history.every((entry) =>
+            record(entry) && epoch(entry.effectiveFrom) && finite(entry.target) && entry.target >= 0 &&
+            (!Object.hasOwn(entry, 'metric') || ['count', 'minutes', 'amount'].includes(entry.metric)) &&
+            (!Object.hasOwn(entry, 'cmp') || ['gte', 'lte'].includes(entry.cmp)) &&
+            (!Object.hasOwn(entry, 'period') || ['day', 'week'].includes(entry.period))));
+          optional('pauses', (pauses) => Array.isArray(pauses) && pauses.every((entry) =>
+            record(entry) && epoch(entry.from) && (entry.to == null || (epoch(entry.to) && entry.to > entry.from))));
+        } else if (key === 'topicRoles') {
+          if (!['focus', 'marker', 'influence'].includes(value.role)) fail(path, 'invalid role');
+          optional('dir', (v) => ['up', 'down'].includes(v));
+          optional('timing', (v) => typeof v === 'boolean');
+        } else {
+          optional('emoji', (v) => typeof v === 'string');
+          optional('color', (v) => typeof v === 'string');
+        }
+      }
     }
-  }
-  if (Array.isArray(obj.events)) {
-    for (const [i, e] of obj.events.entries()) {
-      if (typeof e.id !== 'number') { errors.push(`events[${i}].id missing/non-numeric`); break; }
-      if (typeof e.time !== 'number') { errors.push(`events[${i}].time missing/non-numeric`); break; }
-      if (typeof e.topicid !== 'number') { errors.push(`events[${i}].topicid missing/non-numeric`); break; }
+    for (const key of ['topicOrder', 'quickBar', 'favorites']) {
+      if (!Object.hasOwn(app, key)) continue;
+      if (!Array.isArray(app[key])) { fail(`${namespace}.${key}`, 'must be an array'); continue; }
+      const seen = new Set();
+      for (const value of app[key]) {
+        const tid = key === 'favorites' ? value?.topicid : value;
+        if (!id(tid) || !topics.has(tid) || seen.has(tid)) fail(`${namespace}.${key}`, 'invalid, unknown or duplicate topic id');
+        if (key === 'favorites' && (!record(value) || (Object.hasOwn(value, 'added') && !epoch(value.added)))) fail(`${namespace}.${key}`, 'invalid favorite');
+        seen.add(tid);
+      }
+    }
+    if (Object.hasOwn(app, 'dayChecks')) {
+      if (!record(app.dayChecks)) fail(`${namespace}.dayChecks`, 'must be a date map');
+      else for (const [key, value] of Object.entries(app.dayChecks)) {
+        if (!dateKey(key) || !['complete', 'none', 'incomplete'].includes(value)) fail(`${namespace}.dayChecks.${key}`, 'invalid date/status');
+      }
+    }
+    if (Object.hasOwn(app, 'insightSettings')) {
+      const settings = app.insightSettings;
+      if (!record(settings)) fail(`${namespace}.insightSettings`, 'must be an object');
+      else for (const [key, value] of Object.entries(settings)) {
+        if (['cutoffHour', 'nightStart', 'nightEnd'].includes(key) && (!finite(value) || value < 0 || value >= 24)) fail(key, 'invalid hour');
+        if (['windowDays', 'insightWindow', 'alertCooldownHours'].includes(key) && (!finite(value) || value <= 0)) fail(key, 'must be positive');
+        if (key === 'alertsEnabled' && typeof value !== 'boolean') fail(key, 'must be boolean');
+        if (key === 'alertOn' && !['alert', 'watch'].includes(value)) fail(key, 'invalid alert level');
+      }
     }
   }
   return errors;
+}
+
+function assertValid(obj) {
+  const errors = validateBackup(obj);
+  if (errors.length) throw new Error(`Invalid backup:\n${errors.join('\n')}`);
+}
+
+function unknownAppFields(app) {
+  return Object.fromEntries(Object.entries(portable(app)).filter(([key]) => !APP_META_KEYS.includes(key) && !['favorites', 'backupSchemaVersion'].includes(key)));
+}
+
+function prepareBackup(obj) {
+  assertValid(obj);
+  const app = readAppMeta(obj);
+  const meta = APP_META_KEYS.filter((k) => app[k] != null).map((key) => ({ key, value: key === 'insightSettings' ? portable(app[key]) : app[key] }));
+  meta.push(
+    { key: 'extraAppMeta', value: unknownAppFields(app) },
+    { key: 'extraTopKeys', value: Object.fromEntries(Object.entries(obj).filter(([k]) => !KNOWN_TOP_KEYS.has(k) && !isLocalKey(k))) },
+    { key: 'lastImport', value: Date.now() },
+    { key: 'originalVersion', value: obj.version ?? 4 },
+    { key: 'backupSchemaVersion', value: app.backupSchemaVersion ?? BACKUP_SCHEMA_VERSION },
+  );
+  // Detach from the caller before any asynchronous work can mutate its data.
+  return JSON.parse(JSON.stringify({
+    topics: obj.topics, events: obj.events,
+    measurements: obj.measurements ?? window.CWDB_DEFAULT_MEASUREMENTS,
+    pendtimes: obj.pendtimes ?? window.CWDB_DEFAULT_PENDTIMES,
+    appdata: (obj.appdata ?? []).filter((row) => !isLocalKey(row.name)), favorites: app.favorites ?? [], meta,
+  }));
 }
 
 function summarize(obj) {
@@ -107,129 +283,167 @@ function summarize(obj) {
  * Replace local DB with the contents of `obj`.
  * Preserves unknown top-level keys in meta.extraKeys.
  */
-async function importReplace(obj) {
-  await CWDB.clearAll();
-  await applyBackup(obj);
+/* Ordinary sync alone opts into timer preservation with complete local ->
+ * merged topic/measurement ID maps. Manual imports/restores clear timers.
+ * The caller owns plotline-data; neither method acquires a Web Lock. */
+async function importReplace(obj, options = {}) {
+  const dataset = prepareBackup(obj);
+  return CWDB.replaceDataset(dataset, options);
+}
+
+async function checkTimerReplacement(obj, options) {
+  return CWDB.checkTimerReplacement(prepareBackup(obj), options);
 }
 
 /**
- * Merge `obj` into local DB.
- *  - topics: keyed by name (case-insensitive). If a topic with the same
- *    name exists, reuse the existing id; otherwise allocate a new one
- *    that doesn't collide. Re-map event topicids accordingly.
- *  - events: keyed by id. Skip duplicates by id+topicid+time.
+ * Atomic merge under one write lock. Incoming IDs are NEVER allocated as
+ * final IDs. Semantic duplicates reuse local records; new records use random
+ * IDs. Same-name unit/kind conflicts reject the whole merge, without conversion.
  */
 async function importMerge(obj) {
-  // existing topics
-  const existingTopics = await CWDB.getAll('topics');
-  const existingByName = new Map(
-    existingTopics.map((t) => [t.name.toLowerCase(), t]));
-  const existingIds = new Set(existingTopics.map((t) => t.id));
-  let nextTopicId = existingTopics.reduce((m, t) => Math.max(m, t.id), 0) + 1;
-
-  const topicIdMap = new Map(); // incoming id -> final id
-  const topicsToWrite = [];
-  for (const t of (obj.topics || [])) {
-    const key = (t.name || '').toLowerCase();
-    if (existingByName.has(key)) {
-      topicIdMap.set(t.id, existingByName.get(key).id);
-    } else {
-      let finalId = t.id;
-      if (existingIds.has(finalId)) finalId = nextTopicId++;
-      existingIds.add(finalId);
-      const newTopic = { ...t, id: finalId };
-      topicIdMap.set(t.id, finalId);
-      topicsToWrite.push(newTopic);
-      existingByName.set(key, newTopic);
+  const incoming = prepareBackup(obj);
+  return CWDB.updateDataset((current) => {
+    const meta = Object.fromEntries(current.meta.map((r) => [r.key, r.value]));
+    const incomingMeta = Object.fromEntries(incoming.meta.map((r) => [r.key, r.value]));
+    const allocate = (name) => {
+      const used = new Set([...current[name], ...incoming[name]].map((r) => r.id));
+      return () => {
+        let id;
+        do { id = CWDB.randomId(); } while (used.has(id));
+        used.add(id);
+        return id;
+      };
+    };
+    const mergeIdentified = (name) => {
+      const next = allocate(name);
+      const byContent = new Map(current[name].map((r) => [recordKey(r), r.id]));
+      const map = new Map();
+      for (const row of incoming[name]) {
+        const key = recordKey(row);
+        let id = byContent.get(key);
+        if (id === undefined) {
+          id = next();
+          current[name].push({ ...row, id });
+          byContent.set(key, id);
+        }
+        map.set(row.id, id);
+      }
+      return map;
+    };
+    const measurementMap = mergeIdentified('measurements');
+    const pendtimeMap = mergeIdentified('pendtimes');
+    const nextTopic = allocate('topics');
+    const byName = new Map(current.topics.map((t) => [t.name.toLowerCase(), t]));
+    const topicMap = new Map(), newTopics = new Set();
+    const resolvedKinds = { ...meta.topicKinds };
+    for (const topic of incoming.topics) {
+      const name = topic.name.toLowerCase();
+      const existing = byName.get(name);
+      const msureid = measurementMap.get(topic.msureid);
+      const kind = incomingMeta.topicKinds?.[topic.id];
+      if (existing) {
+        if (existing.msureid !== msureid || (kind && resolvedKinds[existing.id] && kind !== resolvedKinds[existing.id])) {
+          throw new Error(`Cannot merge "${topic.name}": its measurement or tracking type differs. Rename the incoming topic or create a separate topic; amounts were not converted.`);
+        }
+        topicMap.set(topic.id, existing.id);
+      } else {
+        const id = nextTopic();
+        const row = { ...topic, id, msureid };
+        if (Object.hasOwn(row, 'pendtimeid')) row.pendtimeid = pendtimeMap.get(row.pendtimeid) ?? row.pendtimeid;
+        current.topics.push(row);
+        byName.set(name, row);
+        topicMap.set(topic.id, id);
+        newTopics.add(id);
+        resolvedKinds[id] = kind;
+      }
     }
-  }
-  if (topicsToWrite.length) await CWDB.putMany('topics', topicsToWrite);
-
-  // existing events: build a dedupe set by topicid|time
-  const existingEvents = await CWDB.getAll('events');
-  const existingEventIds = new Set(existingEvents.map((e) => e.id));
-  const existingEventKeys = new Set(
-    existingEvents.map((e) => `${e.topicid}|${e.time}|${e.qant}`));
-  let nextEventId = existingEvents.reduce((m, e) => Math.max(m, e.id), 0) + 1;
-
-  const eventsToWrite = [];
-  for (const e of (obj.events || [])) {
-    const mappedTopic = topicIdMap.get(e.topicid) ?? e.topicid;
-    const key = `${mappedTopic}|${e.time}|${e.qant ?? 0}`;
-    if (existingEventKeys.has(key)) continue;
-    let finalId = e.id;
-    if (existingEventIds.has(finalId)) finalId = nextEventId++;
-    existingEventIds.add(finalId);
-    existingEventKeys.add(key);
-    eventsToWrite.push({ ...e, id: finalId, topicid: mappedTopic });
-  }
-  if (eventsToWrite.length) await CWDB.putMany('events', eventsToWrite);
-
-  // Merge measurements / pendtimes / appdata by id/name; existing wins.
-  if (Array.isArray(obj.measurements)) {
-    const existing = await CWDB.getAll('measurements');
-    const have = new Set(existing.map((m) => m.id));
-    const add = obj.measurements.filter((m) => !have.has(m.id));
-    if (add.length) await CWDB.putMany('measurements', add);
-  }
-  if (Array.isArray(obj.pendtimes)) {
-    const existing = await CWDB.getAll('pendtimes');
-    const have = new Set(existing.map((p) => p.id));
-    const add = obj.pendtimes.filter((p) => !have.has(p.id));
-    if (add.length) await CWDB.putMany('pendtimes', add);
-  }
-  if (Array.isArray(obj.appdata)) {
-    const existing = await CWDB.getAll('appdata');
-    const have = new Set(existing.map((a) => a.name));
-    const add = obj.appdata.filter((a) => !have.has(a.name));
-    if (add.length) await CWDB.putMany('appdata', add);
-  }
-
-  const appMeta = readAppMeta(obj);
-  if (appMeta) await applyAppMeta(appMeta);
-  await preserveUnknownKeys(obj);
+    const nextEvent = allocate('events');
+    const eventKeys = new Set(current.events.map(eventKey));
+    for (const event of incoming.events) {
+      const row = { ...event, topicid: topicMap.get(event.topicid) };
+      if (Object.hasOwn(row, 'msureid')) row.msureid = measurementMap.get(row.msureid);
+      const key = eventKey(row);
+      if (eventKeys.has(key)) continue;
+      current.events.push({ ...row, id: nextEvent() });
+      eventKeys.add(key);
+    }
+    const appNames = new Set(current.appdata.map((r) => r.name));
+    for (const row of incoming.appdata) if (!appNames.has(row.name) && !isLocalKey(row.name)) {
+      current.appdata.push(row);
+      appNames.add(row.name);
+    }
+    // Remap from the ORIGINAL map once; never mutate numeric keys in place.
+    for (const key of TOPIC_MAP_KEYS) {
+      const result = { ...meta[key] };
+      for (const [tid, value] of Object.entries(incomingMeta[key] || {})) {
+        const mapped = topicMap.get(Number(tid));
+        if (newTopics.has(mapped) && !Object.hasOwn(result, mapped)) result[mapped] = value;
+      }
+      if (meta[key] !== undefined || incomingMeta[key] !== undefined) meta[key] = result;
+    }
+    for (const key of ['topicOrder', 'quickBar']) {
+      if (meta[key] === undefined && incomingMeta[key] === undefined) continue;
+      const result = [...(meta[key] || [])], have = new Set(result);
+      for (const id of incomingMeta[key] || []) {
+        const mapped = topicMap.get(id);
+        if (newTopics.has(mapped) && !have.has(mapped)) { result.push(mapped); have.add(mapped); }
+      }
+      meta[key] = result;
+    }
+    const favorites = new Set(current.favorites.map((f) => f.topicid));
+    for (const favorite of incoming.favorites) {
+      const topicid = topicMap.get(favorite.topicid);
+      if (newTopics.has(topicid) && !favorites.has(topicid)) {
+        current.favorites.push({ ...favorite, topicid });
+        favorites.add(topicid);
+      }
+    }
+    for (const key of ['dayChecks', 'insightSettings', 'extraAppMeta', 'extraTopKeys']) {
+      if (meta[key] !== undefined || incomingMeta[key] !== undefined) meta[key] = existingWins(meta[key], incomingMeta[key]);
+    }
+    meta.lastImport = incomingMeta.lastImport;
+    meta.backupSchemaVersion = Math.max(meta.backupSchemaVersion || BACKUP_SCHEMA_VERSION, incomingMeta.backupSchemaVersion);
+    if (meta.originalVersion === undefined) meta.originalVersion = incomingMeta.originalVersion;
+    current.meta = Object.entries(meta).map(([key, value]) => ({ key, value }));
+    return current;
+  });
 }
 
-async function applyBackup(obj) {
-  if (Array.isArray(obj.measurements) && obj.measurements.length) {
-    await CWDB.putMany('measurements', obj.measurements);
-  } else {
-    await CWDB.putMany('measurements', window.CWDB_DEFAULT_MEASUREMENTS);
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
   }
-  if (Array.isArray(obj.pendtimes) && obj.pendtimes.length) {
-    await CWDB.putMany('pendtimes', obj.pendtimes);
-  } else {
-    await CWDB.putMany('pendtimes', window.CWDB_DEFAULT_PENDTIMES);
-  }
-  if (Array.isArray(obj.topics)) await CWDB.putMany('topics', obj.topics);
-  if (Array.isArray(obj.events)) await CWDB.putMany('events', obj.events);
-  if (Array.isArray(obj.appdata)) await CWDB.putMany('appdata', obj.appdata);
-
-  await applyAppMeta(readAppMeta(obj));
-  await preserveUnknownKeys(obj);
-  await CWDB.setMeta('lastImport', Date.now());
-  await CWDB.setMeta('originalVersion', obj.version ?? 4);
+  return JSON.stringify(value);
 }
 
-async function preserveUnknownKeys(obj) {
-  const extras = {};
-  for (const k of Object.keys(obj)) {
-    if (!KNOWN_TOP_KEYS.has(k)) extras[k] = obj[k];
-  }
-  if (Object.keys(extras).length) {
-    await CWDB.setMeta('extraTopKeys', extras);
-  }
+function recordKey(row) {
+  return canonical(Object.fromEntries(Object.entries(row).filter(([key]) => key !== 'id')));
 }
+
+function eventKey(row) {
+  return recordKey({ ...row, qant: row.qant ?? 0, cost: row.cost ?? 0, note: row.note ?? '' });
+}
+
+function existingWins(existing, incoming) {
+  if (existing === undefined) return incoming;
+  if (existing && incoming && typeof existing === 'object' && typeof incoming === 'object' && !Array.isArray(existing) && !Array.isArray(incoming)) {
+    return Object.fromEntries([...new Set([...Object.keys(incoming), ...Object.keys(existing)])].map((key) => [
+      key, existingWins(Object.hasOwn(existing, key) ? existing[key] : undefined, Object.hasOwn(incoming, key) ? incoming[key] : undefined),
+    ]));
+  }
+  return existing;
+}
+
+// Historical entry point is now safe on its own; callers must NOT clear first.
+async function applyBackup(obj) { return importReplace(obj); }
 
 async function buildExportObject() {
   const now = new Date();
-  const [measurements, pendtimes, topics, events, appdata] = await Promise.all([
-    CWDB.getAll('measurements'),
-    CWDB.getAll('pendtimes'),
-    CWDB.getAll('topics'),
-    CWDB.getAll('events'),
-    CWDB.getAll('appdata'),
-  ]);
+  const dataset = await CWDB.getDataset();
+  const { measurements, pendtimes, topics, events } = dataset;
+  const appdata = dataset.appdata.filter((row) => !isLocalKey(row.name));
+  const meta = Object.fromEntries(dataset.meta.map((r) => [r.key, r.value]));
 
   // sort topics by name to match the original layout
   topics.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
@@ -242,8 +456,8 @@ async function buildExportObject() {
   });
   pendtimes.sort((a, b) => a.id - b.id);
 
-  const version = await CWDB.getMeta('originalVersion', 4);
-  const appMeta = await buildAppMeta();
+  const version = meta.originalVersion ?? 4;
+  const appMeta = await buildAppMeta(dataset);
   const out = {
     version,
     saveddatelong: now.getTime(),
@@ -258,7 +472,7 @@ async function buildExportObject() {
     [APP_META_TOP_KEY]: appMeta,
   };
 
-  const extras = await CWDB.getMeta('extraTopKeys', {});
+  const extras = portable(meta.extraTopKeys);
   for (const [k, v] of Object.entries(extras)) {
     if (!(k in out)) out[k] = v;
   }
@@ -364,8 +578,8 @@ async function exportToCsv(filename) {
 }
 
 async function safetyBackup() {
-  const events = await CWDB.getAll('events');
-  if (!events.length) return; // nothing to back up
+  // Topics, goals, preferences and custom units are valuable without events.
+  // Even an apparently empty dataset gets a recoverable pre-mutation snapshot.
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-` +
@@ -375,12 +589,14 @@ async function safetyBackup() {
 
 window.CWIO = {
   APP_META_KEYS,
+  BACKUP_SCHEMA_VERSION,
   buildAppMeta,
   applyAppMeta,
   applyBackup,
   validateBackup,
   summarize,
   importReplace,
+  checkTimerReplacement,
   importMerge,
   buildExportObject,
   exportToFile,

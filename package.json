@@ -3,7 +3,8 @@
   "private": true,
   "description": "Dev-only manifest. The app itself has no dependencies and no build step; these packages exist purely to run the smoke tests in Node.",
   "scripts": {
-    "test": "node insights-smoke.js && node goals-smoke.js && node drive-smoke.js && node ui-smoke.js",
+    "test": "node stats-smoke.js && node insights-smoke.js && node goals-smoke.js && node storage-smoke.js && node drive-smoke.js && node sync-smoke.js && node sw-smoke.js && node ui-smoke.js",
+    "test:browser": "node browser-smoke.js",
     "screenshots": "node screenshots.js",
     "logo": "node logo.js"
   },

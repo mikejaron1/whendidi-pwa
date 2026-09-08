@@ -2,9 +2,9 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#161c30" />
-  <meta name="description" content="Track habits and symptoms, then find which ones actually affect how you feel. Plotline runs real statistics on your own log - private, offline-first, and with every finding explained in plain language." />
+  <meta name="description" content="Track habits and symptoms, then explore associations in your own log. Private, offline-first statistics with findings and uncertainty explained in plain language." />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -20,21 +20,22 @@
   <div class="app-shell">
     <div class="statusbar-pad"></div>
     <header class="app-header">
-      <button class="icon-btn" id="menuBtn" aria-label="Menu">☰</button>
-      <div class="title" id="appTitle">Plotline<span class="sync-pill" id="syncPill" style="display:none;"></span></div>
-      <button class="icon-btn" id="exportBtn" aria-label="Export" title="Export JSON">⬇</button>
-      <button class="icon-btn" id="addBtn" aria-label="Add event">＋</button>
+      <button class="icon-btn" id="menuBtn" aria-label="Menu" aria-expanded="false" aria-controls="drawer">☰</button>
+      <div class="title" id="appTitle">Plotline<button type="button" class="sync-pill" id="syncPill" aria-label="Google Drive sync" style="display:none;"></button></div>
     </header>
 
     <nav class="app-tabs" id="tabs" role="tablist">
-      <button class="tab" role="tab" data-view="categories" aria-selected="true">Categories</button>
+      <button class="tab" role="tab" data-view="categories" aria-selected="true">Topics</button>
       <button class="tab" role="tab" data-view="recent"     aria-selected="false">Recent</button>
       <button class="tab" role="tab" data-view="day"        aria-selected="false">Day</button>
       <button class="tab" role="tab" data-view="stats"      aria-selected="false">Statistics</button>
       <button class="tab" role="tab" data-view="insights"   aria-selected="false">Insights</button>
     </nav>
 
-    <main class="app-main" id="main" aria-live="polite">
+    <div class="banner" id="updateNotice" hidden>
+      <span>A complete offline update is ready.</span><button class="btn" id="installUpdate">Update now</button>
+    </div>
+    <main class="app-main" id="main" role="tabpanel" tabindex="-1">
       <!-- views injected here -->
     </main>
 
@@ -54,6 +55,7 @@
         <button id="navImport">📥 Import JSON…</button>
         <button id="navExport">💾 Export JSON</button>
         <button id="navExportCsv">📊 Export CSV (for Sheets/Excel)</button>
+        <button id="navReport">📄 Export a date-range summary</button>
         <button id="navBackup">🛟 Save safety backup</button>
         <div class="section">Setup</div>
         <button id="navTopics">🗂 Manage topics</button>
@@ -66,7 +68,7 @@
         <button id="navStorage">💽 Storage status</button>
         <a class="drawer-link" href="/privacy.html" target="_blank" rel="noopener">🔒 Privacy policy</a>
         <div class="section">Danger zone</div>
-        <button id="navWipe" class="danger">🗑 Wipe all local data…</button>
+        <button id="navWipe" class="danger">🗑 Reset this device…</button>
       </nav>
       <div class="drawer-version" id="drawerVersion">—</div>
     </aside>
@@ -83,6 +85,7 @@
 
   <!-- Scripts -->
   <script src="/vendor/chart.umd.min.js"></script>
+  <script src="/js/version.js"></script>
   <script src="/js/config.js"></script>
   <script src="/js/db.js"></script>
   <script src="/js/import-export.js"></script>
@@ -90,11 +93,17 @@
   <script src="/js/insights.js"></script>
   <script src="/js/goals.js"></script>
   <script src="/js/drive.js"></script>
+  <script src="/js/ui.js"></script>
+  <script src="/js/charts.js"></script>
+  <script src="/js/model.js"></script>
+  <script src="/js/report.js"></script>
   <script src="/js/app.js"></script>
   <script>
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('/sw.js').catch(console.error);
+        navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
+          .then((registration) => window.CWAPP.watchUpdates(registration))
+          .catch(console.error);
       });
     }
   </script>

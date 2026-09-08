@@ -17,8 +17,6 @@
 
 /* ==================== math / stats primitives ==================== */
 
-const MS_DAY = 86400000;
-
 function mean(xs) {
   if (!xs.length) return NaN;
   let s = 0;
@@ -237,7 +235,7 @@ function mannWhitney(a, b) {
 
 /* Benjamini-Hochberg FDR. Mutates each test, adding `q`. */
 function benjaminiHochberg(tests) {
-  const valid = tests.filter((t) => isFinite(t.p));
+  const valid = tests.filter((t) => Number.isFinite(t.p));
   const sorted = valid.slice().sort((a, b) => a.p - b.p);
   const m = sorted.length;
   let prev = 1;
@@ -323,26 +321,19 @@ function normalizeRoles(roles = {}) {
 
 /* Logical day start: a trip at 2am belongs to the previous night, so days
  * roll over at `cutoffHour` (default 4am) rather than midnight. */
-function dayKey(ts, cutoffHour) {
-  const d = new Date(ts - cutoffHour * 3600000);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
+function dayKey(ts, cutoffHour = 4) {
+  return window.CWSTATS.dayKey(ts, cutoffHour);
 }
 
 /* Step a day key by n calendar days. Never use key + n*MS_DAY: DST shifts
  * would produce keys that don't line up with dayKey() and manifest as
  * phantom empty days (which then fake correlations). */
 function addDays(key, n) {
-  const d = new Date(key);
-  d.setDate(d.getDate() + n);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
+  return window.CWSTATS.addDays(key, n);
 }
 
-function minutesFromDayStart(ts, cutoffHour) {
-  const key = dayKey(ts, cutoffHour);
-  const start = key + cutoffHour * 3600000;
-  return Math.round((ts - start) / 60000);
+function minutesFromDayStart(ts, cutoffHour = 4) {
+  return window.CWSTATS.minutesFromDayStart(ts, cutoffHour);
 }
 
 /* Convert "minutes from logical day start" back to a clock label. */
@@ -387,8 +378,10 @@ function tagsOf(note) {
  * @param {number} o.cutoffHour logical day rollover hour (default 4)
  * @param {number} o.days      how many trailing days to include (default 400)
  */
-function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, days = 400,
-                     nightStart = 22, nightEnd = 6 }) {
+function buildDaily({ events = [], topics = [], roles = {}, kinds = {}, cutoffHour = 4, days = 400,
+                     nightStart = 22, nightEnd = 6, topicPrefs = {}, dayChecks = {},
+                     measurements = {}, now = Date.now() } = {}) {
+  days = Math.min(400, Math.max(1, Math.floor(Number(days) || 400)));
   const norm = normalizeRoles(roles);
   const byRole = { focus: [], marker: [], influence: [] };
   const timingIds = [];
@@ -403,7 +396,6 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
     topics.filter((t) => (kinds[t.id] || '') === 'duration').map((t) => t.id)
   );
 
-  const now = Date.now();
   const todayKey = dayKey(now, cutoffHour);
   const startKey = addDays(todayKey, -(days - 1));
 
@@ -412,13 +404,15 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
     if (!rows.has(key)) {
       rows.set(key, {
         key,
-        date: new Date(key + cutoffHour * 3600000),
+        date: new Date(key),
         counts: {},        // topicId -> n
         sums: {},          // topicId -> summed qant (seconds for durations)
         firsts: {},        // topicId -> minutes from day start
         lasts: {},
         nights: {},        // topicId -> n logged inside the night window
         sevMax: {},        // topicId -> max severity
+        sevMean: {}, sevCounts: {}, latest: {}, latestTimes: {}, values: {},
+        observed: {}, check: dayChecks[window.CWSTATS.logicalDate(key)] || null,
         tags: new Set(),
         events: 0,
       });
@@ -426,7 +420,7 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
     return rows.get(key);
   };
 
-  // Pre-create every day in range so gaps count as real zeros.
+  // Keep every calendar day: accessors distinguish observed zeros from gaps.
   for (let k = startKey; k <= todayKey; k = addDays(k, 1)) ensure(k);
 
   // A night window can wrap midnight (22 -> 6) or not (0 -> 6).
@@ -434,7 +428,20 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
     ? (hr >= nightStart || hr < nightEnd)
     : (hr >= nightStart && hr < nightEnd));
 
+  const trackingStarts = {};
+  for (const t of topics) {
+    const configured = topicPrefs[t.id]?.trackingStart;
+    if (Number.isFinite(configured)) trackingStarts[t.id] = dayKey(configured, cutoffHour);
+  }
   for (const e of events) {
+    if (e.time > now) continue;
+    const key = dayKey(e.time, cutoffHour);
+    if (!Number.isFinite(topicPrefs[e.topicid]?.trackingStart)) {
+      trackingStarts[e.topicid] = Math.min(trackingStarts[e.topicid] ?? Infinity, key);
+    }
+  }
+  for (const e of events) {
+    if (e.time > now) continue;
     const key = dayKey(e.time, cutoffHour);
     if (key < startKey || key > todayKey) continue;
     const row = ensure(key);
@@ -442,12 +449,21 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
     const min = minutesFromDayStart(e.time, cutoffHour);
     row.events++;
     row.counts[tid] = (row.counts[tid] || 0) + 1;
-    row.sums[tid] = (row.sums[tid] || 0) + Number(e.qant || 0);
+    const q = window.CWSTATS.quantity(e);
+    row.sums[tid] = (row.sums[tid] || 0) + q;
+    if (row.latestTimes[tid] == null || e.time >= row.latestTimes[tid]) {
+      row.latestTimes[tid] = e.time; row.latest[tid] = q;
+    }
     if (row.firsts[tid] == null || min < row.firsts[tid]) row.firsts[tid] = min;
     if (row.lasts[tid] == null || min > row.lasts[tid]) row.lasts[tid] = min;
     if (isNight(new Date(e.time).getHours())) row.nights[tid] = (row.nights[tid] || 0) + 1;
-    const sev = Number(e.cost || 0);
-    if (sev > (row.sevMax[tid] || 0)) row.sevMax[tid] = sev;
+    const sev = e.cost == null || e.cost === '' ? 0 : Number(e.cost);
+    if (!Number.isFinite(sev)) throw new Error(`Invalid severity for event ${e.id ?? ''}`);
+    if (sev > 0) {
+      row.sevMax[tid] = Math.max(row.sevMax[tid] || 0, sev);
+      row.sevMean[tid] = (row.sevMean[tid] || 0) + sev;
+      row.sevCounts[tid] = (row.sevCounts[tid] || 0) + 1;
+    }
     for (const t of tagsOf(e.note)) row.tags.add(t);
   }
 
@@ -456,11 +472,22 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
     const dow = r.date.getDay();
     r.dow = (dow + 6) % 7;              // 0 = Mon
     r.weekend = (dow === 0 || dow === 6) ? 1 : 0;
+    r.usable = r.check !== 'incomplete' && (r.events > 0 || ['complete', 'none'].includes(r.check));
+    for (const t of topics) {
+      const tid = t.id;
+      r.observed[tid] = r.usable && trackingStarts[tid] != null && r.key >= trackingStarts[tid];
+      const aggregation = topicPrefs[tid]?.aggregation || 'sum';
+      r.values[tid] = r.counts[tid]
+        ? aggregation === 'mean' ? r.sums[tid] / r.counts[tid]
+          : aggregation === 'latest' ? r.latest[tid] : r.sums[tid]
+        : aggregation === 'sum' && r.observed[tid] ? 0 : null;
+      if (r.sevCounts[tid]) r.sevMean[tid] /= r.sevCounts[tid];
+    }
   }
 
-  // Trim leading days before the very first logged event (avoid fake zeros
-  // for a period the user simply wasn't tracking).
-  let firstIdx = list.findIndex((r) => r.events > 0);
+  // Trim before tracking began; each topic still has its own observation floor.
+  const earliest = Math.min(...Object.values(trackingStarts));
+  let firstIdx = list.findIndex((r) => r.key >= earliest);
   if (firstIdx < 0) firstIdx = list.length;
   const trimmed = list.slice(firstIdx);
 
@@ -471,6 +498,13 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
 
   return {
     days: trimmed,
+    kinds, topicPrefs, measurements, trackingStarts, todayKey,
+    dataQuality: {
+      unknownDays: trimmed.filter((r) => !r.usable && r.check !== 'incomplete').length,
+      incompleteDays: trimmed.filter((r) => r.check === 'incomplete').length,
+      assumedZeroDays: trimmed.filter((r) => r.events > 0 && !['complete', 'none'].includes(r.check)).length,
+      assumption: 'On logged days, unlogged tracked count topics are assumed zero. Unchecked empty days and incomplete days are excluded; observed mean/latest values remain missing.',
+    },
     cutoffHour, nightStart, nightEnd,
     roles: norm,
     byRole, focusIds, markerIds, timingIds,
@@ -478,6 +512,10 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
     hasDurationFor, hasNightFor,
     hasFocus: focusIds.length > 0,
   };
+}
+
+function observedValue(row, tid, value) {
+  return row.observed[tid] ? value : null;
 }
 
 /* ==================== predictors & outcomes ==================== */
@@ -500,26 +538,43 @@ function buildOutcomes(table, topics) {
     const dir = table.roles[tid]?.dir || 'down';
     const base = { topicId: tid, dir, kind: 'continuous' };
     out.push({ ...base, key: `focus:${tid}:count`, label: `${name} per day`,
-      unit: '/day', digits: 1, get: (r) => r.counts[tid] || 0 });
+      unit: '/day', digits: 1, metric: 'count', get: (r) => observedValue(r, tid, r.counts[tid] || 0) });
     if (table.hasDurationFor(tid)) {
       out.push({ ...base, key: `focus:${tid}:minutes`, label: `time on ${name} per day`,
-        unit: ' min', digits: 0, get: (r) => (r.sums[tid] || 0) / 60 });
+        unit: ' min', digits: 0, metric: 'minutes', primary: true,
+        get: (r) => observedValue(r, tid, (r.sums[tid] || 0) / 60) });
+    }
+    if (table.kinds[tid] === 'amount') {
+      const aggregation = table.topicPrefs[tid]?.aggregation || 'sum';
+      const unit = table.measurements[tid]?.symbol || table.measurements[tid]?.unit || '';
+      out.push({ ...base, key: `focus:${tid}:amount`, label: `${name} (${aggregation}${unit ? `, ${unit}` : ''})`,
+        unit: unit ? ` ${unit}` : '', digits: 1, metric: 'amount', aggregation, primary: true,
+        get: (r) => observedValue(r, tid, r.values[tid]) });
+    }
+    if (table.days.some((r) => r.sevCounts[tid])) {
+      for (const [metric, field, label] of [['severity', 'sevMax', 'maximum'], ['severityMean', 'sevMean', 'mean']]) {
+        out.push({ ...base, key: `focus:${tid}:${metric}`, label: `${name} severity (${label})`,
+          unit: ' rating', digits: 1, metric, get: (r) => observedValue(r, tid, r[field][tid] ?? null) });
+      }
     }
     if (table.hasNightFor(tid)) {
       out.push({ ...base, key: `focus:${tid}:night`, label: `${name} overnight`,
-        unit: '/night', digits: 1, get: (r) => r.nights[tid] || 0 });
+        unit: '/night', digits: 1, get: (r) => observedValue(r, tid, r.nights[tid] || 0) });
     }
     out.push({ ...base, key: `focus:${tid}:first`, label: `time of first ${name}`,
       unit: '', digits: 0, fmt: 'time',
-      get: (r) => (r.firsts[tid] == null ? null : r.firsts[tid]) });
+      get: (r) => observedValue(r, tid, r.firsts[tid] ?? null) });
   }
 
   for (const tid of table.markerIds) {
     out.push({ key: `marker:${tid}:any`, label: `${nameOf(tid)} that day`,
       kind: 'binary', unit: '', digits: 1, topicId: tid, dir: 'down',
-      get: (r) => (r.counts[tid] ? 1 : 0) });
+      get: (r) => observedValue(r, tid, r.counts[tid] ? 1 : 0) });
   }
 
+  for (const tid of table.focusIds) {
+    if (!out.some((o) => o.topicId === tid && o.primary)) out.find((o) => o.key === `focus:${tid}:count`).primary = true;
+  }
   return out;
 }
 
@@ -537,14 +592,15 @@ function buildPredictors(table, topics, kinds = {}) {
     const t = topics.find((x) => x.id === tid);
     if (!t) continue;
     const self = [`focus:${tid}:count`, `focus:${tid}:minutes`,
-                  `focus:${tid}:night`, `focus:${tid}:first`, `marker:${tid}:any`];
+                  `focus:${tid}:night`, `focus:${tid}:first`, `focus:${tid}:amount`,
+                  `focus:${tid}:severity`, `focus:${tid}:severityMean`, `marker:${tid}:any`];
     out.push({ key: `first:${tid}`, label: `First ${t.name} (time of day)`, type: 'time',
-      excludeOutcomes: self, get: (r) => (r.firsts[tid] ?? null) });
+      excludeOutcomes: self, get: (r) => observedValue(r, tid, r.firsts[tid] ?? null) });
     out.push({ key: `last:${tid}`, label: `Last ${t.name} (time of day)`, type: 'time',
-      excludeOutcomes: self, get: (r) => (r.lasts[tid] ?? null) });
+      excludeOutcomes: self, get: (r) => observedValue(r, tid, r.lasts[tid] ?? null) });
     out.push({ key: `window:${tid}`, label: `${t.name} window (first→last)`, type: 'hours',
       excludeOutcomes: self,
-      get: (r) => (r.firsts[tid] != null && r.lasts[tid] != null
+      get: (r) => observedValue(r, tid, r.firsts[tid] != null && r.lasts[tid] != null
         ? (r.lasts[tid] - r.firsts[tid]) / 60 : null) });
   }
 
@@ -558,13 +614,14 @@ function buildPredictors(table, topics, kinds = {}) {
     const tid = t.id;
     const role = roles[tid]?.role || 'influence';
     const selfOutcomes = [`focus:${tid}:count`, `focus:${tid}:minutes`,
-                          `focus:${tid}:night`, `focus:${tid}:first`, `marker:${tid}:any`];
+                          `focus:${tid}:night`, `focus:${tid}:first`, `focus:${tid}:amount`,
+                          `focus:${tid}:severity`, `focus:${tid}:severityMean`, `marker:${tid}:any`];
     out.push({
       key: `topic:${tid}`,
       label: `${t.name} (count)`,
       type: 'count',
       role, excludeOutcomes: selfOutcomes,
-      get: (r) => r.counts[tid] || 0,
+      get: (r) => observedValue(r, tid, r.counts[tid] || 0),
     });
     if ((kinds[tid] || '') === 'amount') {
       out.push({
@@ -572,7 +629,7 @@ function buildPredictors(table, topics, kinds = {}) {
         label: `${t.name} (amount)`,
         type: 'amount',
         role, excludeOutcomes: selfOutcomes,
-        get: (r) => (r.counts[tid] ? r.sums[tid] || 0 : 0),
+        get: (r) => observedValue(r, tid, r.values[tid]),
       });
     }
   }
@@ -591,17 +648,19 @@ function buildPredictors(table, topics, kinds = {}) {
 
 /* Pair up predictor (day d - lag) with outcome (day d), dropping nulls. */
 function pairSeries(days, predictor, outcome, lag) {
-  const xs = [], ys = [];
+  const xs = [], ys = [], dates = [], sourceDates = [];
+  const byKey = new Map(days.map((r) => [r.key, r]));
   for (let i = 0; i < days.length; i++) {
-    const src = days[i - lag];
-    if (!src) continue;
+    const src = byKey.get(addDays(days[i].key, -lag));
+    if (!src || src.usable === false || days[i].usable === false) continue;
     const x = predictor.get(src);
     const y = outcome.get(days[i]);
     if (x == null || !isFinite(x)) continue;
     if (y == null || !isFinite(y)) continue;
     xs.push(x); ys.push(y);
+    dates.push(days[i].key); sourceDates.push(src.key);
   }
-  return { xs, ys };
+  return { xs, ys, dates, sourceDates };
 }
 
 const MIN_N = 20;
@@ -617,7 +676,7 @@ function runTests({ table, predictors, outcomes, lags = [0, 1], minN = MIN_N }) 
     for (const predictor of predictors) {
       if (predictor.excludeOutcomes?.includes(outcome.key)) continue;
       for (const lag of lags) {
-        const { xs, ys } = pairSeries(days, predictor, outcome, lag);
+        const { xs, ys, dates, sourceDates } = pairSeries(days, predictor, outcome, lag);
         if (xs.length < minN) continue;
         const uniqX = new Set(xs);
         if (uniqX.size < 2) continue;
@@ -636,6 +695,7 @@ function runTests({ table, predictors, outcomes, lags = [0, 1], minN = MIN_N }) 
           outcomeFmt: outcome.fmt || null,
           lag,
           n: xs.length,
+          sampleDates: dates, sourceDates,
         };
 
         const isBinaryX = uniqX.size === 2 && uniqX.has(0);
@@ -663,7 +723,7 @@ function runTests({ table, predictors, outcomes, lags = [0, 1], minN = MIN_N }) 
           test.aLabel = aLabel;
           test.bLabel = bLabel;
           test.d = cohensD(groupA, groupB);
-          test.p = isFinite(w.p) ? w.p : mw.p;
+          test.p = w.p;
           test.pNonparam = mw.p;
           const pr = pearson(xs, ys);
           test.r = pr.r;
@@ -689,8 +749,8 @@ function runTests({ table, predictors, outcomes, lags = [0, 1], minN = MIN_N }) 
         // parametric and the rank-based test. This costs a little power but
         // kills outlier-driven false positives, which matter more here.
         test.pParametric = test.p;
-        if (isFinite(test.pNonparam)) test.p = Math.max(test.p, test.pNonparam);
-        if (!isFinite(test.p)) continue;
+        if (!Number.isFinite(test.p) || !Number.isFinite(test.pNonparam)) continue;
+        test.p = Math.max(test.p, test.pNonparam);
         test.strength = Math.abs(isFinite(test.d) ? test.d : (test.r || 0));
         tests.push(test);
       }
@@ -702,7 +762,7 @@ function runTests({ table, predictors, outcomes, lags = [0, 1], minN = MIN_N }) 
 }
 
 function significanceLabel(t) {
-  if (!isFinite(t.q)) return { level: 'none', label: 'n/a' };
+  if (!Number.isFinite(t.q)) return { level: 'none', label: 'n/a' };
   if (t.q < 0.01) return { level: 'strong', label: 'significant (q<0.01)' };
   if (t.q < 0.05) return { level: 'strong', label: 'significant (q<0.05)' };
   if (t.q < 0.15) return { level: 'weak', label: 'suggestive (q<0.15)' };
@@ -750,35 +810,37 @@ function baselineStatus(table, topics = [], { windowDays = 7, baselineDays = 90 
     const cur = mean(v);
     const med = median(b);
     const spread = mad(b) || sd(b) || 0;
-    const z = spread > 0 ? (cur - med) / spread : 0;
-    const pct = med > 0 ? ((cur - med) / med) * 100 : 0;
+    const delta = cur - med;
+    const z = spread > 0 ? delta / spread : delta === 0 ? 0 : Math.sign(delta) * Infinity;
+    const pct = med !== 0 ? (delta / Math.abs(med)) * 100 : null;
     // Significance of the window mean vs baseline distribution.
     const w = welch(v, b);
-    if (cur === 0 && med === 0) return null;   // nothing tracked here
     const badWay = dir === 'up' ? -1 : 1;      // sign of a change that is bad
     const moved = z * badWay;
     const m = {
       key, label, unit, digits, dir,
-      current: cur, baseline: med, z, pct,
+      current: cur, baseline: med, z, pct, delta, changeLabel: med === 0 ? (cur === 0 ? 'unchanged' : 'from none') : null,
+      sampleDays: v.length, baselineSampleDays: b.length,
       p: w.p,
       worse: moved > 0,
-      elevated: moved >= 1.5 && Math.abs(pct) >= 15 && (isFinite(w.p) ? w.p < 0.1 : true),
-      improved: moved <= -1.5 && Math.abs(pct) >= 15,
+      elevated: moved >= 1.5 && (pct == null ? delta !== 0 : Math.abs(pct) >= 15) && (isFinite(w.p) ? w.p < 0.1 : true),
+      improved: moved <= -1.5 && (pct == null ? delta !== 0 : Math.abs(pct) >= 15),
     };
     out.metrics.push(m);
     return m;
   };
 
-  const addRare = (key, label, recentCount, baseCount, baseN) => {
-    if (baseN < 21) return null;
+  const addRare = (key, label, recentCount, baseCount, baseN, recentN) => {
+    if (baseN < 21 || recentN < 3) return null;
     const rate = baseCount / baseN;               // events per day
-    const lambda = rate * recent.length;
+    const lambda = rate * recentN;
     const p = poissonTailP(recentCount, lambda);
     const m = {
       key, label, rare: true, dir: 'down',
       current: recentCount, baseline: lambda, p,
-      unit: ` in ${recent.length}d`, digits: 1,
-      pct: lambda > 0 ? ((recentCount - lambda) / lambda) * 100 : (recentCount ? 100 : 0),
+      unit: ` in ${recentN} observed days`, digits: 1,
+      pct: lambda > 0 ? ((recentCount - lambda) / lambda) * 100 : null,
+      delta: recentCount - lambda, changeLabel: lambda === 0 ? 'from none' : null,
       z: lambda > 0 ? (recentCount - lambda) / Math.sqrt(lambda) : 0,
       worse: recentCount > lambda,
       elevated: recentCount >= 2 && p < 0.1 && recentCount > lambda,
@@ -788,30 +850,23 @@ function baselineStatus(table, topics = [], { windowDays = 7, baselineDays = 90 
     return m;
   };
 
-  for (const tid of table.focusIds) {
-    const name = nameOf(tid);
-    const dir = table.roles[tid]?.dir || 'down';
-    addContinuous(`focus:${tid}:count`, `${name} per day`,
-      recent.map((r) => r.counts[tid] || 0), base.map((r) => r.counts[tid] || 0),
-      '/day', 1, dir);
-    if (table.hasNightFor(tid)) {
-      addContinuous(`focus:${tid}:night`, `${name} overnight`,
-        recent.map((r) => r.nights[tid] || 0), base.map((r) => r.nights[tid] || 0),
-        '/night', 1, dir);
-    }
-    if (table.hasDurationFor(tid)) {
-      addContinuous(`focus:${tid}:minutes`, `Time on ${name} per day`,
-        recent.map((r) => (r.sums[tid] || 0) / 60), base.map((r) => (r.sums[tid] || 0) / 60),
-        ' min', 0, dir);
-    }
+  for (const o of buildOutcomes(table, topics).filter((o) => o.kind === 'continuous' && !o.fmt)) {
+    addContinuous(o.key, o.label, recent.map(o.get), base.map(o.get), o.unit, o.digits, o.dir);
   }
 
   // Markers are rare by nature, so they get a Poisson tail test rather than
   // a mean-vs-baseline comparison.
   for (const tid of table.markerIds) {
+    const rv = recent.filter((r) => r.observed[tid]);
+    const bv = base.filter((r) => r.observed[tid]);
     addRare(`marker:${tid}`, nameOf(tid),
-      recent.reduce((s, r) => s + (r.counts[tid] || 0), 0),
-      base.reduce((s, r) => s + (r.counts[tid] || 0), 0), base.length);
+      rv.reduce((s, r) => s + (r.counts[tid] || 0), 0),
+      bv.reduce((s, r) => s + (r.counts[tid] || 0), 0), bv.length, rv.length);
+  }
+  if (!out.metrics.length) {
+    out.level = 'insufficient';
+    out.reasons.push('Not enough observed days for a baseline comparison.');
+    return out;
   }
 
   const elevated = out.metrics.filter((m) => m.elevated);
@@ -828,7 +883,7 @@ function baselineStatus(table, topics = [], { windowDays = 7, baselineDays = 90 
     const wayTxt = m.pct >= 0 ? '+' : '';
     out.reasons.push(
       `${m.label}: ${fmtNum(m.current, m.digits)}${m.unit} vs usual ${fmtNum(m.baseline, m.digits)}${m.unit} ` +
-      `(${wayTxt}${Math.round(m.pct)}%)`
+      (m.pct == null ? `(from none; +${fmtNum(m.delta, m.digits)}${m.unit})` : `(${wayTxt}${Math.round(m.pct)}%)`)
     );
   }
   for (const m of improved) {
@@ -842,9 +897,10 @@ function baselineStatus(table, topics = [], { windowDays = 7, baselineDays = 90 
   // Where does this window rank against every other window of the same
   // length? Uses the primary focus topic.
   const primary = table.focusIds[0];
-  if (primary != null && days.length >= 40) {
+  if (primary != null && days.length >= 40 && recent.every((r) => r.observed[primary])) {
     const totals = [];
     for (let i = 0; i + windowDays <= days.length; i++) {
+      if (!days.slice(i, i + windowDays).every((r) => r.observed[primary])) continue;
       let s = 0;
       for (let j = i; j < i + windowDays; j++) s += days[j].counts[primary] || 0;
       totals.push(s);
@@ -861,7 +917,8 @@ function baselineStatus(table, topics = [], { windowDays = 7, baselineDays = 90 
     out.primaryDir = dir;
     // Don't let the headline say "normal" while this is one of the most
     // extreme windows on record in the direction that matters.
-    const extreme = dir === 'up' ? pct <= 10 : pct >= 90;
+    const extreme = sorted[0] !== sorted[sorted.length - 1] &&
+      (dir === 'up' ? pct <= 10 && curTotal < median(sorted) : pct >= 90 && curTotal > median(sorted));
     if (extreme && (out.level === 'ok' || out.level === 'better')) {
       out.level = 'watch';
       const cmp = dir === 'up'
@@ -936,14 +993,16 @@ function describeTest(test, cutoffHour, { withSignificance = false } = {}) {
  * workouts or cigarettes without any domain vocabulary of its own. */
 function descriptiveInsights(table, topics = [], windowDays = 90) {
   const out = [];
-  const days = table.days.slice(-windowDays);
-  if (days.length < 21) return out;
+  const window = table.days.slice(-windowDays);
+  if (window.length < 21) return out;
   const cutoffHour = table.cutoffHour;
   const nameById = new Map(topics.map((t) => [t.id, t.name]));
   const nameOf = (id) => nameById.get(id) || `topic ${id}`;
   const dowNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
   for (const tid of table.focusIds) {
+    const days = window.filter((r) => r.observed[tid]);
+    if (days.length < 3) continue;
     const name = nameOf(tid);
     const dir = table.roles[tid]?.dir || 'down';
     const counts = days.map((r) => r.counts[tid] || 0);
@@ -956,28 +1015,26 @@ function descriptiveInsights(table, topics = [], windowDays = 90) {
     out.push({
       kind: 'summary',
       score: 1,
-      text: `Over the last ${days.length} days you averaged ${fmtNum(avg, 1)} ${name}/day ` +
+      text: `Across ${days.length} observed days in the last ${window.length} calendar days you averaged ${fmtNum(avg, 1)} ${name}/day ` +
         `(median ${fmtNum(median(counts), 0)}, ${peakWord} ${peak}).`,
     });
 
     // Trend over the window
-    const idx = days.map((_, i) => i);
-    const pr = pearson(idx, counts);
-    if (isFinite(pr.p) && pr.p < 0.05) {
+    if (counts.length >= 21) {
       const third = Math.floor(counts.length / 3);
       const first = mean(counts.slice(0, third));
       const last = mean(counts.slice(-third));
       const ch = pctChange(last, first);
-      const rising = pr.r > 0;
+      const rising = last > first;
       const good = (dir === 'up') === rising;
       out.push({
         kind: 'trend',
-        score: 3 + Math.abs(pr.r),
+        score: 2,
         good,
-        text: `${name} is ${rising ? 'trending up' : 'trending down'} across this window: ` +
+        text: `Descriptively, ${name} is ${rising ? 'higher' : 'lower'} across observed days in this window: ` +
           `${fmtNum(first, 1)}/day early vs ${fmtNum(last, 1)}/day recently` +
           (ch != null ? ` (${ch >= 0 ? '+' : ''}${Math.round(ch)}%)` : '') +
-          ` (p=${fmtNum(pr.p, 3)}).`,
+          '.',
       });
     }
 
@@ -1017,13 +1074,12 @@ function descriptiveInsights(table, topics = [], windowDays = 90) {
       const [lo, loIdx] = valid[valid.length - 1];
       const ch = pctChange(hi, lo);
       if (ch != null && ch >= 20) {
-        const w = welch(buckets[hiIdx], buckets[loIdx]);
         out.push({
           kind: 'dow',
-          score: 2 + (isFinite(w.p) && w.p < 0.05 ? 1 : 0),
+          score: 2,
           text: `${dowNames[hiIdx]} is your highest day for ${name} (${fmtNum(hi, 1)}/day) ` +
             `and ${dowNames[loIdx]} your lowest (${fmtNum(lo, 1)}/day) — ${Math.round(ch)}% apart` +
-            (isFinite(w.p) ? `, p=${fmtNum(w.p, 3)}` : '') + '.',
+            ' (descriptive).',
         });
       }
     }
@@ -1042,19 +1098,18 @@ function descriptiveInsights(table, topics = [], windowDays = 90) {
     }
 
     // Month-over-month
-    if (table.days.length >= 60) {
-      const last30 = table.days.slice(-30).map((r) => r.counts[tid] || 0);
-      const prev30 = table.days.slice(-60, -30).map((r) => r.counts[tid] || 0);
+    if (window.length >= 60) {
+      const last30 = window.slice(-30).filter((r) => r.observed[tid]).map((r) => r.counts[tid] || 0);
+      const prev30 = window.slice(-60, -30).filter((r) => r.observed[tid]).map((r) => r.counts[tid] || 0);
       const ch = pctChange(mean(last30), mean(prev30));
       if (ch != null && Math.abs(ch) >= 10) {
-        const w = welch(last30, prev30);
         out.push({
           kind: 'mom',
-          score: 2.5 + (isFinite(w.p) && w.p < 0.05 ? 1 : 0),
+          score: 2.5,
           good: (ch > 0) === (dir === 'up'),
           text: `Last 30 days vs the 30 before: ${fmtNum(mean(last30), 1)} vs ` +
             `${fmtNum(mean(prev30), 1)} ${name}/day ` +
-            `(${ch >= 0 ? '+' : ''}${Math.round(ch)}%${isFinite(w.p) ? `, p=${fmtNum(w.p, 3)}` : ''}).`,
+            `(${ch >= 0 ? '+' : ''}${Math.round(ch)}%; observed days only, descriptive).`,
         });
       }
     }
@@ -1062,6 +1117,8 @@ function descriptiveInsights(table, topics = [], windowDays = 90) {
 
   // Marker days: how often, and what they coincide with.
   if (table.markerIds.length) {
+    const days = window.filter((r) => table.markerIds.every((tid) => r.observed[tid]));
+    if (!days.length) return out;
     const anyMarker = (r) => table.markerIds.some((tid) => (r.counts[tid] || 0) > 0);
     const label = table.markerIds.map(nameOf).join(' or ');
     const badDays = days.filter(anyMarker).length;
@@ -1070,13 +1127,12 @@ function descriptiveInsights(table, topics = [], windowDays = 90) {
       let text = `${badDays} of the last ${days.length} days had ${label} ` +
         `(${Math.round((badDays / days.length) * 100)}%).`;
       if (primary != null) {
-        const withBad = days.filter(anyMarker).map((r) => r.counts[primary] || 0);
-        const without = days.filter((r) => !anyMarker(r)).map((r) => r.counts[primary] || 0);
+        const withBad = days.filter((r) => r.observed[primary] && anyMarker(r)).map((r) => r.counts[primary] || 0);
+        const without = days.filter((r) => r.observed[primary] && !anyMarker(r)).map((r) => r.counts[primary] || 0);
         if (withBad.length >= 3 && without.length >= 3) {
-          const w = welch(withBad, without);
           text += ` On those days you averaged ${fmtNum(mean(withBad), 1)} ` +
             `${nameOf(primary)} vs ${fmtNum(mean(without), 1)} otherwise` +
-            (isFinite(w.p) ? ` (p=${fmtNum(w.p, 3)})` : '') + '.';
+            ' (descriptive).';
         }
       }
       out.push({ kind: 'marker', score: 3, text });
@@ -1087,16 +1143,16 @@ function descriptiveInsights(table, topics = [], windowDays = 90) {
 
     // Current clear streak
     let streak = 0;
-    for (let i = table.days.length - 1; i >= 0; i--) {
-      if (anyMarker(table.days[i])) break;
+    for (let i = window.length - 1; i >= 0; i--) {
+      if (!table.markerIds.every((tid) => window[i].observed[tid]) || anyMarker(window[i])) break;
       streak++;
     }
     let best = 0, run = 0;
-    for (const r of table.days) { if (anyMarker(r)) run = 0; else { run++; if (run > best) best = run; } }
+    for (const r of window) { if (!table.markerIds.every((tid) => r.observed[tid]) || anyMarker(r)) run = 0; else { run++; if (run > best) best = run; } }
     if (best > 0) {
       out.push({ kind: 'streak', score: 1.4,
         text: `Current clear streak: ${streak} day${streak === 1 ? '' : 's'} ` +
-          `without ${label} (best ever: ${best}).` });
+          `without ${label} (best in this window: ${best}).` });
     }
   }
 
@@ -1111,7 +1167,7 @@ function descriptiveInsights(table, topics = [], windowDays = 90) {
  * screen. Splits days into early vs late thirds and reports the difference,
  * plus the continuous correlation.
  */
-function timingAnalysis(table, topics, tests) {
+function timingAnalysis(table, topics) {
   if (!table.timingIds.length) return [];
   const rows = [];
   const cutoffHour = table.cutoffHour;
@@ -1122,9 +1178,9 @@ function timingAnalysis(table, topics, tests) {
   const predictors = [];
   for (const tid of table.timingIds) {
     predictors.push({ key: `first:${tid}`, label: `First ${nameOf(tid)}`, topicId: tid,
-      get: (r) => (r.firsts[tid] ?? null) });
+      get: (r) => observedValue(r, tid, r.firsts[tid] ?? null) });
     predictors.push({ key: `last:${tid}`, label: `Last ${nameOf(tid)}`, topicId: tid,
-      get: (r) => (r.lasts[tid] ?? null) });
+      get: (r) => observedValue(r, tid, r.lasts[tid] ?? null) });
   }
 
   // Count/duration/marker outcomes answer "how much"; the time-of-first
@@ -1135,11 +1191,12 @@ function timingAnalysis(table, topics, tests) {
     for (const o of outcomes) {
       if (o.topicId === p.topicId) continue;    // don't explain a topic with itself
       for (const lag of [0, 1]) {
-        const { xs, ys } = pairSeries(days, p, o, lag);
+        const { xs, ys, dates, sourceDates } = pairSeries(days, p, o, lag);
         if (xs.length < MIN_N) continue;
         const sorted = xs.slice().sort((a, b) => a - b);
         const lo = quantile(sorted, 1 / 3);
         const hi = quantile(sorted, 2 / 3);
+        if (lo >= hi) continue;
         const early = [], late = [];
         for (let i = 0; i < xs.length; i++) {
           if (xs[i] <= lo) early.push(ys[i]);
@@ -1149,8 +1206,7 @@ function timingAnalysis(table, topics, tests) {
         const w = welch(late, early);
         const mw = mannWhitney(late, early);
         const pr = pearson(xs, ys);
-        const matched = tests.find((t) =>
-          t.predictorKey === p.key && t.outcomeKey === o.key && t.lag === lag);
+        if (!Number.isFinite(w.p) || !Number.isFinite(mw.p)) continue;
         rows.push({
           predictor: p.label,
           predictorKey: p.key,
@@ -1160,25 +1216,28 @@ function timingAnalysis(table, topics, tests) {
           outcomeDir: o.dir || 'down',
           lag,
           n: xs.length,
+          sampleDates: dates, sourceDates, family: 'timing-tertiles',
+          outcomeUnit: o.unit,
           earlyThreshold: lo,
           lateThreshold: hi,
-          earlyLabel: `before ${fmtDayMinutes(lo, cutoffHour)}`,
-          lateLabel: `after ${fmtDayMinutes(hi, cutoffHour)}`,
+          earlyLabel: `at or before ${fmtDayMinutes(lo, cutoffHour)}`,
+          lateLabel: `at or after ${fmtDayMinutes(hi, cutoffHour)}`,
           earlyMean: mean(early),
           lateMean: mean(late),
           nEarly: early.length,
           nLate: late.length,
           delta: mean(late) - mean(early),
           pct: pctChange(mean(late), mean(early)),
-          p: isFinite(w.p) ? w.p : mw.p,
+          p: Math.max(w.p, mw.p),
+          pParametric: w.p,
           pNonparam: mw.p,
-          q: matched ? matched.q : NaN,
           r: pr.r,
           d: cohensD(late, early),
         });
       }
     }
   }
+  benjaminiHochberg(rows);
   return rows;
 }
 
@@ -1186,15 +1245,20 @@ function timingAnalysis(table, topics, tests) {
 
 function analyze({ events = [], topics = [], roles = {}, kinds = {}, cutoffHour = 4,
                    windowDays = 7, insightWindow = 90,
-                   nightStart = 22, nightEnd = 6 } = {}) {
-  const table = buildDaily({ events, topics, roles, kinds, cutoffHour, nightStart, nightEnd });
+                   nightStart = 22, nightEnd = 6, topicPrefs = {}, dayChecks = {},
+                   measurements = {}, now = Date.now() } = {}) {
+  const table = buildDaily({ events, topics, roles, kinds, cutoffHour, nightStart, nightEnd,
+    topicPrefs, dayChecks, measurements, now });
+  insightWindow = Math.min(400, Math.max(1, Math.floor(Number(insightWindow) || 90)));
+  const start = addDays(table.todayKey, -(insightWindow - 1));
+  const recentTable = { ...table, days: table.days.filter((r) => r.key >= start) };
   const outcomes = buildOutcomes(table, topics);
-  const predictors = buildPredictors(table, topics, kinds);
-  const tests = outcomes.length && table.days.length >= 30
-    ? runTests({ table, predictors, outcomes })
+  const predictors = buildPredictors(recentTable, topics, kinds);
+  const tests = outcomes.length && recentTable.days.length >= 30
+    ? runTests({ table: recentTable, predictors, outcomes })
     : [];
   const status = baselineStatus(table, topics, { windowDays });
-  const timing = timingAnalysis(table, topics, tests);
+  const timing = timingAnalysis(recentTable, topics);
 
   // Rank the narrative insights: significant tests first, then descriptives.
   // Keep only the stronger lag for each predictor/outcome pair so the list
@@ -1215,10 +1279,15 @@ function analyze({ events = [], topics = [], roles = {}, kinds = {}, cutoffHour 
       text: describeTest(t, cutoffHour),
     });
   }
-  for (const d of descriptiveInsights(table, topics, insightWindow)) narrative.push(d);
+  for (const d of descriptiveInsights(recentTable, topics, insightWindow)) narrative.push(d);
   narrative.sort((a, b) => b.score - a.score);
 
-  return { table, tests, status, timing, narrative, outcomes, predictors };
+  return { table, tests, status, timing, narrative, outcomes, predictors,
+    dataQuality: table.dataQuality,
+    window: { days: insightWindow, start, end: table.todayKey,
+      from: window.CWSTATS.dayBoundary(start, cutoffHour), to: now + 1,
+      startDate: window.CWSTATS.logicalDate(start), endDate: window.CWSTATS.logicalDate(table.todayKey),
+      sampleDates: recentTable.days.filter((r) => r.usable).map((r) => r.key) } };
 }
 
 /* Rolling mean helper for charts. */
@@ -1227,10 +1296,10 @@ function rolling(values, window) {
   let sum = 0;
   const q = [];
   for (const v of values) {
-    const x = (v == null || !isFinite(v)) ? 0 : v;
-    q.push(x); sum += x;
-    if (q.length > window) sum -= q.shift();
-    out.push(q.length === window ? sum / window : null);
+    const x = (v == null || !isFinite(v)) ? null : v;
+    q.push(x); sum += x || 0;
+    if (q.length > window) sum -= q.shift() || 0;
+    out.push(q.length === window && q.every((x) => x != null) ? sum / window : null);
   }
   return out;
 }

@@ -11,9 +11,20 @@ const path = require('path');
 const assert = require('assert');
 
 global.window = {};
+new Function(fs.readFileSync(path.join(__dirname, 'js', 'stats.js'), 'utf8'))();
 const src = fs.readFileSync(path.join(__dirname, 'js', 'insights.js'), 'utf8');
 new Function(src)();
 const I = window.CWINSIGHTS;
+const S = window.CWSTATS;
+const NOW = new Date(2026, 8, 8, 23, 59).getTime();
+const analyze = I.analyze;
+I.analyze = (opts) => {
+  const dayChecks = {};
+  for (let key = S.addDays(S.dayKey(NOW, 4), -400); key <= S.dayKey(NOW, 4); key = S.addDays(key, 1)) {
+    dayChecks[S.logicalDate(key)] = 'complete';
+  }
+  return analyze({ now: NOW, dayChecks, ...opts });
+};
 
 /* ---- synthetic log builder ---- */
 const DAY = 86400000;
@@ -35,9 +46,9 @@ function poisson(lambda) {
 function buildEvents(days, plan) {
   const events = [];
   let id = 1;
-  const today = Date.now();
+  const today = NOW;
   for (let d = 0; d < days; d++) {
-    const dayStart = today - (days - 1 - d) * DAY;
+    const dayStart = S.addDays(S.dayKey(today), -(days - 1 - d));
     const base = new Date(dayStart); base.setHours(0, 0, 0, 0);
     for (const spec of plan(d)) {
       for (let i = 0; i < spec.n; i++) {
@@ -235,6 +246,115 @@ test('night window is configurable', () => {
     '11pm events should count as night in a 22-6 window');
   assert.ok(!narrow.outcomes.some((o) => o.key === `focus:${A}:night`),
     '11pm events must not count as night in a 0-5 window');
+});
+
+test('tracking starts and daily check-ins preserve missing values', () => {
+  const today = S.dayKey(NOW, 4), start = S.addDays(today, -5);
+  const events = [
+    { topicid: 1, time: S.dayBoundary(start, 12), qant: 60 },
+    { topicid: 1, time: S.dayBoundary(S.addDays(start, 1), 12), qant: 62 },
+    { topicid: 1, time: S.dayBoundary(S.addDays(start, 1), 18), qant: 64 },
+    { topicid: 2, time: S.dayBoundary(S.addDays(start, 2), 12), qant: 2 },
+  ];
+  const res = analyze({ now: NOW, events, topics: [{ id: 1, name: 'Weight' }, { id: 2, name: 'Water' }],
+    roles: { 1: 'focus' }, kinds: { 1: 'amount', 2: 'amount' },
+    topicPrefs: { 1: { aggregation: 'latest' }, 2: { aggregation: 'sum' } },
+    dayChecks: { [S.logicalDate(S.addDays(start, 1))]: 'none',
+      [S.logicalDate(S.addDays(start, 3))]: 'complete',
+      [S.logicalDate(S.addDays(start, 4))]: 'incomplete' }, measurements: { 1: { symbol: 'kg' } } });
+  const amount = res.outcomes.find((o) => o.metric === 'amount');
+  const count = res.outcomes.find((o) => o.metric === 'count');
+  assert.strictEqual(amount.get(res.table.days[1]), 64, 'data wins over none');
+  assert.strictEqual(amount.get(res.table.days[2]), null, 'unmeasured is not zero');
+  assert.strictEqual(amount.get(res.table.days[3]), null, 'complete does not invent weight');
+  assert.strictEqual(count.get(res.table.days[3]), 0);
+  assert.strictEqual(count.get(res.table.days[4]), null);
+  assert.strictEqual(count.get(res.table.days[5]), null);
+  assert.strictEqual(res.table.days[0].observed[2], false, 'no earlier history for later topic');
+  assert.match(amount.label, /kg/);
+  assert.strictEqual(res.dataQuality.unknownDays, 1);
+});
+
+test('mean amount, duration and rating outcomes retain their units', () => {
+  const time = S.dayBoundary(S.dayKey(NOW), 12);
+  const res = analyze({ now: NOW, topics: [{ id: 1, name: 'Score' }, { id: 2, name: 'Walk' }],
+    events: [{ topicid: 1, time, qant: 4, cost: 2 }, { topicid: 1, time: time + 1000, qant: 8, cost: 4 },
+      { topicid: 2, time, qant: 1800 }],
+    kinds: { 1: 'amount', 2: 'duration' }, roles: { 1: 'focus', 2: 'focus' },
+    topicPrefs: { 1: { aggregation: 'mean' } } });
+  const row = res.table.days[0];
+  const get = (key) => res.outcomes.find((o) => o.key === key).get(row);
+  assert.strictEqual(get('focus:1:amount'), 6);
+  assert.strictEqual(get('focus:1:severity'), 4);
+  assert.strictEqual(get('focus:1:severityMean'), 3);
+  assert.strictEqual(get('focus:2:minutes'), 30);
+  assert.throws(() => analyze({ events: [{ topicid: 1, time, qant: 'bad' }], now: NOW }), /quantity/);
+});
+
+test('lags pair actual calendar days rather than adjacent observed rows', () => {
+  const key = S.dayKey(NOW);
+  const rows = [{ key: S.addDays(key, -2), x: 1 }, { key, x: 2 }];
+  const p = { get: (r) => r.x };
+  assert.strictEqual(I.pairSeries(rows, p, p, 1).xs.length, 0);
+  assert.deepStrictEqual(I.pairSeries(rows, p, p, 2).xs, [1]);
+  assert.deepStrictEqual(I.rolling([1, null, 3, 5], 2), [null, null, null, 4]);
+});
+
+test('zero baselines report additive change, unavailable baselines never normal', () => {
+  const start = S.addDays(S.dayKey(NOW), -99), checks = {};
+  for (let k = start; k <= S.dayKey(NOW); k = S.addDays(k, 1)) checks[S.logicalDate(k)] = 'complete';
+  const args = { now: NOW, topics: [{ id: 1, name: 'Thing' }], roles: { 1: 'focus' },
+    topicPrefs: { 1: { trackingStart: start } }, dayChecks: checks,
+    events: Array.from({ length: 7 }, (_, i) => ({ topicid: 1, qant: 0,
+      time: S.dayBoundary(S.addDays(S.dayKey(NOW), -i), 12) })) };
+  const res = analyze(args);
+  const m = res.status.metrics.find((m) => m.key === 'focus:1:count');
+  assert.strictEqual(m.pct, null);
+  assert.strictEqual(m.delta, 1);
+  assert.strictEqual(m.changeLabel, 'from none');
+  assert.match(res.status.reasons.join(' '), /from none/);
+  const unknown = analyze({ ...args, events: [], dayChecks: {} });
+  assert.strictEqual(unknown.status.level, 'insufficient');
+});
+
+test('all inference is bounded by recent calendar days and timing corrects its own p family', () => {
+  seed = 312;
+  const events = buildEvents(200, (d) => {
+    const hour = 10 + (d % 8);
+    return [{ topicid: 1, n: 1, hour }, { topicid: 2, n: 1 + poisson(hour / 4), hour: 20 }];
+  });
+  const res = I.analyze({ events, topics: [{ id: 1, name: 'Meal' }, { id: 2, name: 'Focus' }],
+    roles: { 1: { role: 'influence', timing: true }, 2: 'focus' }, insightWindow: 60 });
+  assert.ok(res.timing.length > 0);
+  for (const t of [...res.tests, ...res.timing]) {
+    assert.ok(t.n <= 60);
+    assert.ok(t.sampleDates.every((k) => k >= res.window.start && k <= res.window.end));
+    assert.ok(t.sourceDates.every((k) => k >= res.window.start));
+  }
+  const expected = res.timing.map((t) => ({ p: Math.max(t.pParametric, t.pNonparam) }));
+  I.benjaminiHochberg(expected);
+  res.timing.forEach((t, i) => {
+    assert.strictEqual(t.p, expected[i].p);
+    assert.strictEqual(t.q, expected[i].q);
+  });
+  assert.ok(res.table.days.length > 60, 'baseline retains older history');
+});
+
+test('reports anchor analysis to a historical exclusive end and cap the calendar window', () => {
+  const endKey = new Date(2026, 5, 20).getTime();
+  const to = S.dayBoundary(endKey, 4);
+  const from = S.dayBoundary(S.addDays(endKey, -30), 4);
+  const res = analyze({ now: to - 1, insightWindow: 30,
+    topics: [{ id: 1, name: 'History' }], roles: { 1: 'focus' },
+    events: [{ topicid: 1, time: from, qant: 0 }, { topicid: 1, time: to, qant: 0 }] });
+  assert.strictEqual(res.window.from, from);
+  assert.strictEqual(res.window.to, to);
+  assert.strictEqual(res.window.days, 30);
+  assert.strictEqual(res.table.days.reduce((n, r) => n + r.events, 0), 1);
+  assert.strictEqual(res.table.todayKey, S.addDays(endKey, -1));
+  const bounded = analyze({ now: to - 1, insightWindow: 1000 });
+  assert.strictEqual(bounded.window.days, 400);
+  assert.strictEqual(bounded.window.from, S.dayBoundary(S.addDays(endKey, -400), 4));
 });
 
 console.log(failures ? `\n${failures} failing` : '\nall passing');

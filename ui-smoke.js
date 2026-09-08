@@ -72,7 +72,7 @@ scripts.forEach(load);
   // 2. Tapping a preset card creates topics with roles.
   const card = w.document.querySelector('[data-preset="symptoms"]');
   card.dispatchEvent(new w.Event('click'));
-  await new Promise((r) => setTimeout(r, 120));
+  await waitFor(async () => (await D.getAll('topics')).length === 5 && !w.document.querySelector('.dialog'));
   const topics = await D.getAll('topics');
   assert(topics.length === 5, `preset seeded ${topics.length} topics, expected 5`);
   ok('symptom preset seeds 5 topics');
@@ -105,6 +105,11 @@ scripts.forEach(load);
     if (d % 17 === 0) evs.push({ id: eid++, topicid: byName['Bad day'], time: at(d, 13), qant: 0, cost: 0 });
   }
   await D.putMany('events', evs);
+  await D.setMeta('topicPrefs', Object.fromEntries(topics.map((topic) =>
+    [topic.id, { trackingStart: at(200, 4), aggregation: 'sum' }])));
+  await D.setTopicGoal(byName['Sleep'], {
+    metric: 'minutes', cmp: 'gte', target: 30, period: 'day', since: at(200, 4),
+  });
   await w.eval('reload()');
 
   for (const view of ['categories', 'recent', 'day', 'stats', 'insights']) {
@@ -160,7 +165,7 @@ scripts.forEach(load);
   w.document.querySelector('#goalTarget').value = '1';
   w.document.querySelector('#goalPeriod').value = 'day';
   w.document.querySelector('#goalSave').dispatchEvent(new w.Event('click'));
-  await new Promise((r) => setTimeout(r, 80));
+  await waitFor(() => !w.document.querySelector('.dialog'));
   const savedGoal = (await D.getTopicGoals())[byName['Sleep']];
   assert(savedGoal && savedGoal.cmp === 'gte' && savedGoal.target === 1,
     'goal editor did not persist: ' + JSON.stringify(savedGoal));
@@ -173,7 +178,7 @@ scripts.forEach(load);
   for (const fn of ['openRolesSetup()', 'openAlertsDialog()']) {
     w.eval(fn);
     assert(w.document.querySelector('#modalRoot .dialog'), `${fn} did not open`);
-    w.eval('closeModal()');
+    w.CWUI.closeModal();
     ok(`${fn} opens`);
   }
 
@@ -184,17 +189,19 @@ scripts.forEach(load);
   w.document.querySelector(`[data-role-dir="${byName['Symptom']}"]`).value = 'up';
   w.document.querySelector(`[data-role-timing="${byName['Symptom']}"]`).checked = true;
   w.document.querySelector('#saveRoles').dispatchEvent(new w.Event('click'));
-  await new Promise((r) => setTimeout(r, 60));
+  await waitFor(() => !w.document.querySelector('.dialog'));
   const saved = N.normalizeRoles(await D.getTopicRoles())[byName['Symptom']];
   assert(saved.role === 'focus' && saved.dir === 'up' && saved.timing === true,
     'role editor lost dir/timing: ' + JSON.stringify(saved));
   ok('role editor saves direction and timing');
+  await w.CWMODEL.whenIdle();
 
   if (errors.length) {
     console.error('\nruntime errors:\n' + errors.join('\n'));
     process.exit(1);
   }
   console.log('\nall passing');
+  w.close();
 })().catch((e) => {
   console.error(e.stack || e);
   if (errors.length) console.error('\nruntime errors:\n' + errors.join('\n'));
@@ -203,3 +210,10 @@ scripts.forEach(load);
 
 function assert(c, m) { if (!c) throw new Error(m); }
 function ok(m) { console.log('  ok  ' + m); }
+async function waitFor(predicate) {
+  const deadline = Date.now() + 5000;
+  while (!await predicate()) {
+    if (Date.now() > deadline) throw new Error('Timed out waiting for the UI action');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}

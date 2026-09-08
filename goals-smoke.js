@@ -12,6 +12,7 @@ const path = require('path');
 
 const ROOT = __dirname;
 const win = {};
+new Function('window', fs.readFileSync(path.join(ROOT, 'js/stats.js'), 'utf8'))(win);
 new Function('window', 'document', 'navigator',
   fs.readFileSync(path.join(ROOT, 'js/insights.js'), 'utf8'))(win, {}, {});
 new Function('window', 'document', 'navigator',
@@ -21,9 +22,9 @@ const G = win.CWGOALS;
 const CUTOFF = 4;
 const DAY = 86400000;
 
-/* A fixed "now" well clear of a DST boundary, at midday so the logical day
+/* A fixed "now" well clear of a DST boundary, late evening so the logical day
  * is unambiguous. */
-const NOW = new Date(2026, 4, 20, 12, 0, 0).getTime();
+const NOW = new Date(2026, 4, 20, 23, 59, 0).getTime();
 
 /* Builds an event `d` days ago at a given hour. */
 function ev(daysAgo, hour = 12, qant = 0) {
@@ -153,13 +154,15 @@ test('weekly goals aggregate the whole week', () => {
 });
 
 /* 11. A partial leading week would be judged unfairly on fewer days. */
-test('an incomplete first week is dropped', () => {
+test('an incomplete first week is visible and excluded from rate', () => {
   const r = G.evaluate({
     events: [], kind: 'timeonly', cutoffHour: CUTOFF, now: NOW,
-    goal: { cmp: 'lte', target: 0, period: 'week', metric: 'count', since: NOW - 30 * DAY },
+    goal: { cmp: 'lte', target: 0, period: 'week', metric: 'count', since: NOW - 29 * DAY },
   });
   const first = r.periods[0];
-  assert.strictEqual(first.days, 7, 'the first retained week must be whole');
+  assert.strictEqual(first.partial, true);
+  assert.strictEqual(first.status, 'partial');
+  assert.strictEqual(first.excluded, true);
 });
 
 /* 12. Completion rate reports settled periods only. */
@@ -210,6 +213,89 @@ test('goals respect the logical day cutoff', () => {
   assert.strictEqual(r.current, 1, 'it satisfies yesterday, keeping a 1-day streak');
 });
 
+  test('goal revisions retain previous targets and apply at next period boundary', () => {
+    const goal = { cmp: 'gte', target: 1, period: 'day', metric: 'count', since: ev(5).time };
+    const changed = G.reviseGoal(goal, { target: 2 }, ev(2).time);
+    assert.strictEqual(changed.history[0].target, 1);
+    assert.strictEqual(changed.history[0].effectiveFrom, goal.since);
+    const r = G.evaluate({ goal: changed, events: [0, 1, 2, 3, 4].map((d) => ev(d)), now: NOW });
+    assert.strictEqual(r.periods.find((p) => p.key === win.CWSTATS.dayKey(ev(3).time, 4)).met, true);
+    assert.strictEqual(r.periods.find((p) => p.key === win.CWSTATS.dayKey(ev(1).time, 4)).met, false);
+    assert.strictEqual(r.periods.find((p) => p.key === win.CWSTATS.dayKey(ev(2).time, 4)).config.target, 1);
+    assert.strictEqual(r.activeGoal.target, 2);
+    assert.strictEqual(G.normalizeGoal(changed).history.length, 1);
+  });
+
+  test('pause intervals preserve completed streaks and survive normalization', () => {
+    let goal = { cmp: 'gte', target: 1, period: 'day', metric: 'count', since: ev(5).time };
+    const S = win.CWSTATS;
+    goal = G.setPaused(goal, true, S.dayBoundary(S.dayKey(ev(2).time, 4), 4));
+    goal = G.setPaused(goal, false, S.dayBoundary(S.dayKey(ev(0).time, 4), 4));
+    const r = G.evaluate({ goal, events: [0, 3, 4].map((d) => ev(d)), now: NOW });
+    assert.strictEqual(r.current, 3);
+    assert.strictEqual(r.periods.filter((p) => p.paused).length, 2);
+    assert.strictEqual(G.normalizeGoal(goal).pauses.length, 1);
+    const paused = G.evaluate({ goal: G.setPaused(goal, true, NOW - 1000), now: NOW, events: [ev(0)] });
+    assert.strictEqual(paused.status, 'paused');
+    assert.match(G.streakLine(paused), /paused/);
+  });
+
+  test('strict check-ins exclude unknown days and mean/latest goals do not invent observations', () => {
+    const S = win.CWSTATS;
+    const goal = { cmp: 'lte', target: 0, period: 'day', metric: 'count', since: ev(5).time };
+    const opts = { goal, events: [], topicId: 1, now: NOW,
+      topicPrefs: { 1: { trackingStart: ev(5).time } }, dayChecks: {
+        [S.logicalDate(NOW, 4)]: 'complete',
+        [S.logicalDate(ev(1).time, 4)]: 'incomplete',
+      } };
+    const r = G.evaluate(opts);
+    assert.strictEqual(r.current, 1);
+    assert.strictEqual(r.totalRecent, 0);
+    assert.strictEqual(r.periods.at(-2).status, 'unknown');
+    assert.match(G.streakLine(r), /observed day/);
+    assert.doesNotMatch(G.streakLine(r), /in a row/);
+    const observed = G.evaluate({ ...opts, goal: { ...goal, metric: 'amount', target: 70 },
+      topicPrefs: { 1: { trackingStart: ev(5).time, aggregation: 'latest' } } });
+    assert.strictEqual(observed.value, null);
+    assert.strictEqual(observed.status, 'unknown');
+  });
+
+  test('weekly revisions do not rewrite the week already in progress', () => {
+    const base = { cmp: 'gte', target: 1, period: 'week', metric: 'count', since: ev(30).time };
+    const changed = G.reviseGoal(base, { target: 20 }, NOW);
+    const r = G.evaluate({ goal: changed, now: NOW, events: [ev(0), ev(8), ev(15)] });
+    assert.strictEqual(r.activeGoal.target, 1);
+    assert.strictEqual(r.goal.target, 20);
+  });
+
+  test('daily and weekly goal boundaries stay on the calendar across both DST changes', () => {
+    const S = win.CWSTATS;
+    for (const month of [2, 10]) {
+      const now = new Date(2026, month, month === 2 ? 12 : 5, 23).getTime();
+      const today = S.dayKey(now, 4);
+      const events = Array.from({ length: 12 }, (_, i) => ({ topicid: 1, qant: 60,
+        time: S.dayBoundary(S.addDays(today, -i), 12) }));
+      const goal = { cmp: 'gte', target: 1, period: 'day', metric: 'count', since: events.at(-1).time };
+      const r = G.evaluate({ goal, events, now, cutoffHour: 4 });
+      assert.strictEqual(r.current, 12);
+      assert.strictEqual(new Set(r.periods.map((p) => S.logicalDate(p.key))).size, 12);
+      assert.ok(r.periods.every((p) => new Date(p.key).getHours() === 0));
+      const w = G.evaluate({ goal: { ...goal, period: 'week' }, events, now, cutoffHour: 4 });
+      assert.ok(w.periods.every((p) => new Date(p.key).getDay() === 1));
+      assert.strictEqual(w.periods.reduce((sum, p) => sum + p.value, 0), 12);
+    }
+  });
+
+  test('future tracking dates and invalid measured quantities cannot fabricate goal progress', () => {
+    const S = win.CWSTATS;
+    const goal = { metric: 'amount', cmp: 'gte', target: 2, period: 'day', since: NOW };
+    assert.throws(() => G.evaluate({ goal, now: NOW, events: [ev(0, 12, 'bad')] }), /quantity/);
+    const r = G.evaluate({ goal, now: NOW, topicId: 1,
+      topicPrefs: { 1: { trackingStart: S.dayBoundary(S.addDays(S.dayKey(NOW, 4), 1), 4) } },
+      dayChecks: { [S.logicalDate(NOW, 4)]: 'complete' } });
+    assert.strictEqual(r.status, 'unknown');
+    assert.strictEqual(r.current, 0);
+  });
 let failed = 0;
 console.log('goals and streaks');
 for (const [name, fn] of tests) {

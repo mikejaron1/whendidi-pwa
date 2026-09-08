@@ -2,7 +2,7 @@
   "id": "/",
   "name": "Plotline: Track & Find Trends",
   "short_name": "Plotline",
-  "description": "Track habits and symptoms, then find which ones actually affect how you feel.",
+  "description": "Track habits and symptoms, then explore associations in your own log.",
   "start_url": "/app/",
   "scope": "/app/",
   "display": "standalone",

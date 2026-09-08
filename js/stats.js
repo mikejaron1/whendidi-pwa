@@ -4,14 +4,44 @@
  * cross-topic correlations.
  */
 
-function startOfDay(ts) {
+function startOfDay(ts, cutoffHour = 0) {
   const d = new Date(ts);
+  if (d.getHours() + d.getMinutes() / 60 < cutoffHour) d.setDate(d.getDate() - 1);
   d.setHours(0, 0, 0, 0);
   return d.getTime();
 }
 
-function startOfWeek(ts) {
+function addDays(key, n) {
+  const d = new Date(key);
+  d.setDate(d.getDate() + n);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function logicalDate(ts, cutoffHour = 0) {
+  const d = new Date(startOfDay(ts, cutoffHour));
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function dayBoundary(key, cutoffHour = 0) {
+  const d = new Date(key);
+  d.setHours(Math.floor(cutoffHour), Math.round((cutoffHour % 1) * 60), 0, 0);
+  return d.getTime();
+}
+
+function minutesFromDayStart(ts, cutoffHour = 0) {
   const d = new Date(ts);
+  return ((d.getHours() * 60 + d.getMinutes() - cutoffHour * 60) % 1440 + 1440) % 1440;
+}
+
+function quantity(e) {
+  const q = e.qant == null || e.qant === '' ? 0 : Number(e.qant);
+  if (!Number.isFinite(q)) throw new Error(`Invalid quantity for event ${e.id ?? ''}`);
+  return q;
+}
+
+function startOfWeek(ts, cutoffHour = 0) {
+  const d = new Date(startOfDay(ts, cutoffHour));
   d.setHours(0, 0, 0, 0);
   const dow = d.getDay(); // 0=Sun
   const diff = (dow + 6) % 7; // Mon-start
@@ -19,8 +49,8 @@ function startOfWeek(ts) {
   return d.getTime();
 }
 
-function startOfMonth(ts) {
-  const d = new Date(ts);
+function startOfMonth(ts, cutoffHour = 0) {
+  const d = new Date(startOfDay(ts, cutoffHour));
   return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
 }
 
@@ -42,26 +72,43 @@ function labelFor(period, ts) {
   return `${d.getDate()}/${d.getMonth()+1}/${d.getFullYear()}`;
 }
 
-function aggregate(events, period) {
+function aggregate(events, period, opts = {}) {
   const bucket = BUCKETERS[period];
   if (!bucket) throw new Error(`unknown period ${period}`);
+  const { cutoffHour = 0, start, end, fill = false, aggregation = 'sum' } = opts;
+  if (!['sum', 'mean', 'latest', 'min', 'max'].includes(aggregation)) throw new Error('Unknown aggregation');
+  if (fill && (!Number.isFinite(start) || !Number.isFinite(end))) throw new Error('Filling requires bounded start/end');
   const map = new Map();
+  const empty = (k) => ({ bucket: k, count: 0, sumQant: 0, minTime: null, maxTime: null,
+    min: null, max: null, latest: null, mean: null, value: 0 });
+  if (fill) {
+    for (let k = bucket(start, cutoffHour), n = 0; k <= bucket(end, cutoffHour); n++) {
+      if (n >= 100000) throw new Error('Aggregation range too large');
+      map.set(k, empty(k));
+      if (period === 'monthly') {
+        const d = new Date(k); d.setMonth(d.getMonth() + 1); k = d.getTime();
+      } else k = addDays(k, period === 'weekly' ? 7 : 1);
+    }
+  }
   for (const e of events) {
-    const k = bucket(e.time);
+    if ((start != null && e.time < start) || (end != null && e.time > end)) continue;
+    const k = bucket(e.time, cutoffHour);
     if (!map.has(k)) {
-      map.set(k, {
-        bucket: k,
-        count: 0,
-        sumQant: 0,
-        minTime: e.time,
-        maxTime: e.time,
-      });
+      map.set(k, empty(k));
     }
     const b = map.get(k);
+    const q = quantity(e);
     b.count++;
-    b.sumQant += Number(e.qant || 0);
-    if (e.time < b.minTime) b.minTime = e.time;
-    if (e.time > b.maxTime) b.maxTime = e.time;
+    b.sumQant += q;
+    b.min = b.min == null ? q : Math.min(b.min, q);
+    b.max = b.max == null ? q : Math.max(b.max, q);
+    if (b.minTime == null || e.time < b.minTime) b.minTime = e.time;
+    if (b.maxTime == null || e.time >= b.maxTime) { b.maxTime = e.time; b.latest = q; }
+  }
+  for (const b of map.values()) {
+    b.sum = b.sumQant;
+    b.mean = b.count ? b.sumQant / b.count : null;
+    b.value = aggregation === 'sum' ? b.sumQant : b[aggregation];
   }
   return Array.from(map.values()).sort((a, b) => b.bucket - a.bucket);
 }
@@ -77,19 +124,23 @@ function intervals(events) {
   return out;
 }
 
-function intervalStats(events) {
+function intervalStats(events, now = Date.now()) {
   const ivs = intervals(events);
-  if (!ivs.length) return null;
+  if (!events.length) return null;
+  const last = now - events.reduce((latest, e) => Math.max(latest, e.time), -Infinity);
+  if (!ivs.length) return { count: 0, min: null, max: null, median: null, avg: null, last, lastInterval: null };
   const sorted = ivs.slice().sort((a, b) => a - b);
   const avg = ivs.reduce((s, x) => s + x, 0) / ivs.length;
-  const median = sorted[Math.floor(sorted.length / 2)];
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
   return {
     count: ivs.length,
     min: sorted[0],
     max: sorted[sorted.length - 1],
     median,
     avg,
-    last: ivs[ivs.length - 1],
+    last,
+    lastInterval: ivs[ivs.length - 1],
   };
 }
 
@@ -104,10 +155,10 @@ function timeOfDay(events) {
 }
 
 /* 7 buckets, Mon..Sun. */
-function dayOfWeek(events) {
+function dayOfWeek(events, cutoffHour = 0) {
   const buckets = new Array(7).fill(0);
   for (const e of events) {
-    const dow = new Date(e.time).getDay(); // 0=Sun
+    const dow = new Date(startOfDay(e.time, cutoffHour)).getDay(); // 0=Sun
     const idx = (dow + 6) % 7;             // Mon-start
     buckets[idx]++;
   }
@@ -118,28 +169,27 @@ function dayOfWeek(events) {
  * Returns: { weeks: [[{date, count, sum}, ...7], ...], maxCount, total }
  * Indexed Mon..Sun within each week. Oldest week first.
  */
-function calendarMatrix(events, weeks = 26) {
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
+function calendarMatrix(events, weeks = 26, cutoffHour = 0, now = Date.now()) {
   // Find start of week (Mon) for "today"
-  const todayMonStart = startOfWeek(now.getTime());
-  const startMs = todayMonStart - (weeks - 1) * 7 * 86400000;
+  const todayMonStart = startOfWeek(now, cutoffHour);
+  const startMs = addDays(todayMonStart, -(weeks - 1) * 7);
   const counts = new Map();
   let maxCount = 0;
   let total = 0;
   for (const e of events) {
-    if (e.time < startMs) continue;
-    const d = startOfDay(e.time);
+    if (e.time > now) continue;
+    const d = startOfDay(e.time, cutoffHour);
+    if (d < startMs) continue;
     counts.set(d, (counts.get(d) || 0) + 1);
     total++;
   }
   for (const v of counts.values()) if (v > maxCount) maxCount = v;
   const out = [];
   for (let w = 0; w < weeks; w++) {
-    const weekStart = startMs + w * 7 * 86400000;
+    const weekStart = addDays(startMs, w * 7);
     const days = [];
     for (let d = 0; d < 7; d++) {
-      const day = weekStart + d * 86400000;
+      const day = addDays(weekStart, d);
       days.push({ date: day, count: counts.get(day) || 0 });
     }
     out.push(days);
@@ -254,6 +304,7 @@ function fmtIntervalShort(ms) {
 window.CWSTATS = {
   aggregate, labelFor,
   startOfDay, startOfWeek, startOfMonth,
+  dayKey: startOfDay, addDays, logicalDate, dayBoundary, minutesFromDayStart, quantity,
   intervals, intervalStats,
   timeOfDay, dayOfWeek, calendarMatrix,
   correlations,

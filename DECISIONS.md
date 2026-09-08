@@ -207,6 +207,20 @@ escape hatch removes control from self-hosters. The hybrid serves both.
 - Data safety remains **no collection**: the token is issued to the user,
   files land in the user's own Drive, and nothing reaches a developer
   server.
+- **Token requests only happen while the app is on screen.** GIS opens a
+  real popup window for *every* `requestAccessToken()` call, including the
+  "silent" `prompt: 'none'` one — on Android that popup is a Custom Tab
+  stacked over the installed PWA. Fired from a background trigger (a
+  throttled auto-sync timer, an `online` event, a Wi-Fi↔cellular
+  `connection change`) the handshake with the frozen opener never
+  completes: the popup's `/gsi/transform` POST aborts, and the resulting
+  *"This site can't be reached — ERR_CONNECTION_ABORTED"* tab (plus a
+  *Confirm Form Resubmission* prompt if reloaded) is still sitting on top
+  of the app when the user returns to it. `js/drive.js` therefore refuses
+  background token requests when `document.visibilityState === 'hidden'`,
+  throwing `BACKGROUNDED` — which does **not** count toward the
+  silent-failure backoff — and re-runs the sync on the next
+  `visibilitychange` back to visible.
 
 ---
 
@@ -349,3 +363,31 @@ migration changed the origin, which is why it destroyed access.
   well as `./` when extracting the script list.
 - `.well-known/assetlinks.json` stays at the root. It is tied to the
   domain, not to where the app is served from.
+
+---
+
+## 9. Reliability before a framework or native migration (v8, 2026-09-08)
+
+**Decision:** retain vanilla JavaScript, local IndexedDB, the current origin and
+manifest identity. Extract shared UI, mutation, chart and report modules without
+adding a runtime framework or build step.
+
+**Data integrity:** new records use insert-only, collision-resistant numeric IDs.
+Backup replacement validates first and commits all stores atomically; merge
+remaps records and their settings together. Device reset disconnects Drive before
+clearing local storage and never uploads an empty replacement.
+
+**Synchronization:** local mutations and Drive snapshots share `plotline-data`
+locking, with a same-page queue fallback. Remote checks, bounded remerges and
+retained recovery snapshots reduce conflict risk; they are not an atomic
+server-side write precondition and must not be described as one.
+
+**Observation semantics:** unknown and incomplete days are not inferred to be
+symptom-free. Mean/latest quantities require observations. Goals retain revision
+and pause history; changed targets apply at the next period boundary. Findings
+describe associations and uncertainty rather than causes.
+
+**Release safety:** one release identifier, complete essential-shell caching,
+explicit update activation after accepted local mutations drain, and regression
+gates before the deployment helper commits or pushes. Native integrations and
+monetization remain separate future decisions.

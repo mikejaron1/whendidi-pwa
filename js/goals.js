@@ -11,20 +11,21 @@
  *
  * Three subtleties drive the whole design:
  *
- *   1. Days with no events are real days. A "at most 0 cigarettes" goal is
- *      met precisely on the days you logged nothing, so periods are built by
- *      walking the calendar, never by grouping the event list.
+ *   1. Periods follow the calendar. When dayChecks is supplied, empty days
+ *      require an explicit complete/none check-in; omitted dayChecks retains
+ *      legacy zero-event assumptions.
  *   2. Today is asymmetric. An "at least" goal you haven't hit yet is still
  *      winnable, so it must not break the streak — it's pending. An "at most"
  *      goal you've already blown is broken now.
- *   3. A streak can't predate its goal. Otherwise "0 cigarettes" would claim
- *      a streak running back to the beginning of time. Streaks are clamped to
- *      whichever came first: the goal's creation, or the topic's first event.
+ *   3. Legacy history starts at the earlier of goal creation/first event.
+ *      Checked-day history additionally respects the topic's tracking start.
+ *      Revisions take effect at a period boundary. Paused, unknown and partial
+ *      periods stay visible but neither contribute to nor break streaks.
  */
 (function () {
   'use strict';
 
-  const N = window.CWINSIGHTS;
+  const N = window.CWSTATS;
   const dayKey = N.dayKey;
   const addDays = N.addDays;
 
@@ -69,7 +70,44 @@
     const metric = ['count', 'minutes', 'amount'].includes(goal.metric)
       ? goal.metric : defaultMetric(kind);
     const since = Number(goal.since) || 0;
-    return { metric, cmp, target, period, since };
+    const effectiveFrom = Number.isFinite(goal.effectiveFrom) ? goal.effectiveFrom : since;
+    const history = (Array.isArray(goal.history) ? goal.history : []).flatMap((s) => {
+      const config = normalizeGoal({ ...s, history: [], pauses: [] }, kind);
+      return config && Number.isFinite(s.effectiveFrom)
+        ? [{ effectiveFrom: s.effectiveFrom, metric: config.metric, cmp: config.cmp,
+          target: config.target, period: config.period }] : [];
+    }).sort((a, b) => a.effectiveFrom - b.effectiveFrom);
+    const pauses = (Array.isArray(goal.pauses) ? goal.pauses : []).filter((p) =>
+      Number.isFinite(p.from) && (p.to == null || (Number.isFinite(p.to) && p.to > p.from)))
+      .map((p) => ({ from: p.from, to: p.to ?? null })).sort((a, b) => a.from - b.from);
+    return { metric, cmp, target, period, since, effectiveFrom, history, pauses };
+  }
+
+  function reviseGoal(existing, changes, now = Date.now()) {
+    const old = normalizeGoal(existing);
+    const next = normalizeGoal({ ...existing, ...changes, since: old?.since || now });
+    if (!next) throw new Error('Invalid goal');
+    if (!old) return { ...next, since: now, effectiveFrom: now };
+    const keys = ['metric', 'cmp', 'target', 'period'];
+    if (keys.every((k) => old[k] === next[k])) return old;
+    if (now < old.effectiveFrom) throw new Error('Goal edits must be chronological');
+    const snapshot = { effectiveFrom: old.effectiveFrom,
+      metric: old.metric, cmp: old.cmp, target: old.target, period: old.period };
+    return { ...next, since: old.since, effectiveFrom: now,
+      history: [...old.history, snapshot], pauses: old.pauses };
+  }
+
+  function setPaused(goal, paused, now = Date.now()) {
+    const g = normalizeGoal(goal);
+    if (!g) throw new Error('Invalid goal');
+    const open = g.pauses.find((p) => p.to == null);
+    if (paused && !open) g.pauses.push({ from: now, to: null });
+    if (!paused && open) {
+      if (now < open.from) throw new Error('Pause end precedes start');
+      open.to = now;
+      g.pauses = g.pauses.filter((p) => p.to == null || p.to > p.from);
+    }
+    return g;
   }
 
   function normalizeGoals(map, kinds = {}) {
@@ -91,20 +129,27 @@
   /* One event's contribution to a period total. */
   function eventValue(ev, metric) {
     if (metric === 'count') return 1;
-    const q = Number(ev.qant || 0);
+    const q = N.quantity(ev);
     return metric === 'minutes' ? q / 60 : q;
   }
 
   /* Builds every period from the goal's floor up to now, marks each met or
    * not, and derives the streaks. Returns null when there is no goal. */
   function evaluate({ events = [], goal, kind = 'timeonly', cutoffHour = 4,
-                      now = Date.now(), lookbackDays = 400 } = {}) {
+                      now = Date.now(), lookbackDays = 400, topicId,
+                      topicPrefs = {}, dayChecks } = {}) {
     const g = normalizeGoal(goal, kind);
     if (!g) return null;
 
     const todayKey = dayKey(now, cutoffHour);
     const horizonKey = addDays(todayKey, -(lookbackDays - 1));
 
+    if (topicId != null) events = events.filter((e) => e.topicid === topicId);
+    events = events.filter((e) => e.time <= now);
+    const tid = topicId ?? events[0]?.topicid;
+    const strictObservation = dayChecks != null;
+    const pref = topicPrefs[tid] || {};
+    const explicitTrackingKey = Number.isFinite(pref.trackingStart) ? dayKey(pref.trackingStart, cutoffHour) : null;
     let firstEventKey = null;
     for (const e of events) {
       const k = dayKey(e.time, cutoffHour);
@@ -119,78 +164,116 @@
     else if (firstEventKey != null) floorKey = firstEventKey;
     else floorKey = todayKey;
     floorKey = Math.max(floorKey, horizonKey);
+    if (strictObservation) {
+      const tracking = explicitTrackingKey ?? firstEventKey;
+      floorKey = Math.max(floorKey, tracking ?? todayKey);
+    }
     if (floorKey > todayKey) floorKey = todayKey;
 
-    // Daily totals across the whole calendar range, zeros included.
+    // Keep calendar rows even when their observation or pause status excludes them.
     const daily = new Map();
-    for (let k = floorKey; k <= todayKey; k = addDays(k, 1)) daily.set(k, 0);
+    for (let k = floorKey; k <= todayKey; k = addDays(k, 1)) daily.set(k, []);
     for (const e of events) {
       const k = dayKey(e.time, cutoffHour);
       if (k < floorKey || k > todayKey) continue;
-      daily.set(k, daily.get(k) + eventValue(e, g.metric));
+      daily.get(k).push(e);
     }
 
-    // Roll days up into the goal's period.
-    let periods;
-    if (g.period === 'day') {
-      periods = Array.from(daily.entries()).map(([key, value]) => ({ key, value, days: 1 }));
-    } else {
-      const byWeek = new Map();
-      for (const [k, v] of daily) {
-        const wk = weekKeyOf(k);
-        const row = byWeek.get(wk) || { key: wk, value: 0, days: 0 };
-        row.value += v;
-        row.days++;
-        byWeek.set(wk, row);
+    const versions = [...g.history, g].sort((a, b) => a.effectiveFrom - b.effectiveFrom);
+    // A revision takes effect at the next period boundary, never halfway through a period.
+    const versionAt = (key) => {
+      const boundary = N.dayBoundary(key, cutoffHour);
+      return versions.filter((v) => v.effectiveFrom <= boundary).pop() || versions[0];
+    };
+    const periods = [];
+    let cursor = floorKey;
+    while (cursor <= todayKey) {
+      let config = versionAt(cursor);
+      let key = config.period === 'week' ? weekKeyOf(cursor) : cursor;
+      config = versionAt(key);
+      key = config.period === 'week' ? weekKeyOf(cursor) : cursor;
+      const end = addDays(key, config.period === 'week' ? 7 : 1);
+      const p = { key, end, config: { ...config, history: undefined, pauses: undefined },
+        value: 0, days: 0, observedDays: 0, pausedDays: 0, partial: cursor > key,
+        current: todayKey < end, pending: false, met: null };
+      const periodEvents = [];
+      let pauseOverlap = false;
+      for (let k = cursor; k < end && k <= todayKey; k = addDays(k, 1)) {
+        const es = daily.get(k) || [];
+        const from = N.dayBoundary(k, cutoffHour), to = N.dayBoundary(addDays(k, 1), cutoffHour);
+        const paused = g.pauses.some((s) => s.from < to && (s.to == null || s.to > from));
+        const check = dayChecks?.[N.logicalDate(k)];
+        const known = !strictObservation || (k >= (explicitTrackingKey ?? firstEventKey ?? Infinity) && check !== 'incomplete' &&
+          (es.length > 0 || check === 'complete' || check === 'none'));
+        p.days++;
+        if (paused) { p.pausedDays++; pauseOverlap = true; }
+        if (known) p.observedDays++;
+        periodEvents.push(...es);
       }
-      periods = Array.from(byWeek.values()).sort((a, b) => a.key - b.key);
-      // A partial first week would be judged on fewer days than it deserves.
-      if (periods.length > 1 && periods[0].days < 7) periods.shift();
-    }
-    periods.sort((a, b) => a.key - b.key);
-
-    const meets = (v) => (g.cmp === 'gte' ? v >= g.target : v <= g.target);
-    for (const p of periods) {
-      p.date = new Date(p.key + cutoffHour * 3600000);
-      p.met = meets(p.value);
-      p.current = false;
-      p.pending = false;
+      const aggregation = config.metric === 'amount' ? (pref.aggregation || 'sum') : 'sum';
+      if (aggregation === 'latest') {
+        periodEvents.sort((a, b) => a.time - b.time);
+        p.value = periodEvents.length ? eventValue(periodEvents[periodEvents.length - 1], config.metric) : null;
+      } else {
+        p.value = periodEvents.reduce((s, e) => s + eventValue(e, config.metric), 0);
+        if (aggregation === 'mean') p.value = periodEvents.length ? p.value / periodEvents.length : null;
+      }
+      p.paused = p.pausedDays === p.days;
+      p.partial = p.partial || (pauseOverlap && !p.paused);
+      p.date = new Date(key);
+      p.unknown = p.observedDays < p.days || p.value == null;
+      p.excluded = p.paused || p.partial || p.unknown;
+      if (!p.excluded) p.met = config.cmp === 'gte' ? p.value >= config.target : p.value <= config.target;
+      p.pending = p.current && !p.excluded && !p.met && config.cmp === 'gte';
+      p.status = p.paused ? 'paused' : p.partial ? 'partial' : p.unknown ? 'unknown'
+        : p.pending ? 'pending' : p.met ? 'met' : 'missed';
+      periods.push(p);
+      cursor = end;
     }
     const cur = periods[periods.length - 1];
-    if (cur) {
-      cur.current = true;
-      // An unfinished "at least" period hasn't failed yet — it's still open.
-      cur.pending = !cur.met && g.cmp === 'gte';
-    }
 
     // Current streak: walk back from now. A pending period is skipped rather
     // than counted, so today's incomplete progress neither adds nor breaks.
     let i = periods.length - 1;
-    if (i >= 0 && periods[i].pending) i--;
     let current = 0;
-    while (i >= 0 && periods[i].met) { current++; i--; }
+    while (i >= 0) {
+      const p = periods[i--];
+      if (p.config.period !== cur.config.period) break;
+      if (p.excluded || p.pending) continue;
+      if (!p.met) break;
+      current++;
+    }
 
     // Best streak only judges periods that actually finished.
     let best = 0;
     let run = 0;
+    let previousPeriod;
     for (const p of periods) {
-      if (p.pending) continue;
-      if (p.met) { run++; if (run > best) best = run; }
+      if (p.config.period !== previousPeriod) run = 0;
+      previousPeriod = p.config.period;
+      if (p.pending || p.excluded) continue;
+      if (p.met) { run++; if (p.config.period === cur.config.period && run > best) best = run; }
       else run = 0;
     }
     if (current > best) best = current;
 
-    const settled = periods.filter((p) => !p.pending);
+    const settled = periods.filter((p) => !p.current && !p.excluded);
     const recent = settled.slice(-30);
     const metRecent = recent.filter((p) => p.met).length;
 
-    const value = cur ? cur.value : 0;
-    const remaining = g.cmp === 'gte'
-      ? Math.max(0, g.target - value)
-      : g.target - value;
+    const value = cur ? cur.value : null;
+    const activeGoal = cur?.config || g;
+    const remaining = value == null ? null : activeGoal.cmp === 'gte'
+      ? Math.max(0, activeGoal.target - value)
+      : activeGoal.target - value;
 
     return {
       goal: g,
+      activeGoal,
+      status: cur?.status || 'unknown',
+      paused: cur?.paused || false, partial: cur?.partial || false,
+      observationMode: strictObservation ? 'checked-days' : 'legacy-zero-days',
+      excludedPeriods: periods.filter((p) => p.excluded).length,
       periods,
       current,
       best,
@@ -214,6 +297,7 @@
   }
 
   function fmtValue(v, goal, measurement) {
+    if (v == null || !Number.isFinite(v)) return '—';
     const rounded = Math.round(v * 10) / 10;
     const num = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
     const unit = unitLabel(goal, measurement);
@@ -232,10 +316,16 @@
   /* The headline sentence: what the user actually wants to read. */
   function streakLine(result, measurement) {
     if (!result) return '';
-    const g = result.goal;
+    if (result.status === 'paused') return 'Goal paused — your completed streak is preserved.';
+    if (result.status === 'partial') return 'Partial period — excluded from your completion rate.';
+    if (result.status === 'unknown') return 'Not enough observations — check in to evaluate this period.';
+    const g = result.activeGoal || result.goal;
     const unit = PERIODS.find((p) => p.key === g.period);
     const n = result.current;
     const noun = n === 1 ? unit.label : unit.plural;
+    if (n > 0 && result.excludedPeriods) {
+      return `${n} observed ${noun} meeting your goal (excluded periods skipped)`;
+    }
     if (n === 0) {
       if (g.cmp === 'lte' && !result.met) {
         return `Over your limit today — ${fmtValue(result.value, g, measurement)} logged.`;
@@ -255,7 +345,7 @@
 
   window.CWGOALS = {
     PERIODS, CMPS,
-    defaultMetric, suggestGoal, normalizeGoal, normalizeGoals,
+    defaultMetric, suggestGoal, normalizeGoal, normalizeGoals, reviseGoal, setPaused,
     weekKeyOf, evaluate,
     unitLabel, fmtValue, describeGoal, streakLine, badge,
   };

@@ -276,26 +276,27 @@ async function test(name, fn) {
 
   await test('transient conditions never count toward the backoff', async () => {
     T.resetTokenClient();
-    for (const code of ['OFFLINE', 'CELLULAR_BLOCKED', 'NO_CLIENT_ID']) {
+    for (const code of ['OFFLINE', 'CELLULAR_BLOCKED', 'NO_CLIENT_ID', 'BACKGROUNDED']) {
       for (let i = 0; i < T.MAX_SILENT_AUTH_FAILURES + 3; i++) {
         T.handleAutoSyncFailure(new Error(code));
       }
     }
     assert.strictEqual(T.autoSyncSuppressed(), false,
-      'being offline or on cellular should not disable auto-sync');
+      'being offline, on cellular or backgrounded should not disable auto-sync');
   });
 
   await test('suppressed auto-sync stops scheduling work', async () => {
     T.resetTokenClient();
+    metaStore.set('driveEnabled', true);
     window.CW_CONFIG.autoSyncOnChange = true;
     const realTimeout = global.setTimeout;
     let scheduled = 0;
     global.setTimeout = (fn, ms) => { scheduled++; return realTimeout(() => {}, 0); };
     try {
-      T.queueAutoSync('change');
+      await T.queueAutoSync('change');
       assert.strictEqual(scheduled, 1, 'healthy session should schedule a sync');
       failAuth(T.MAX_SILENT_AUTH_FAILURES);
-      T.queueAutoSync('change');
+      await T.queueAutoSync('change');
       assert.strictEqual(scheduled, 1, 'scheduled a sync while suppressed');
     } finally {
       global.setTimeout = realTimeout;

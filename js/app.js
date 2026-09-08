@@ -1,4 +1,7 @@
-/* Plotline - UI controller. Vanilla JS, single-page, 3 views. */
+/* Plotline - views and application workflows. */
+
+const { openModal, closeModal, openDrawer, closeDrawer, openConfirm, handlePopState,
+  snack, escapeHtml, bindAction, reportError } = window.CWUI;
 
 const VIEWS = ['categories', 'recent', 'day', 'stats', 'insights'];
 const state = {
@@ -13,6 +16,12 @@ const state = {
   quickBar: [],   // fixed, user-curated ordered list of topic ids for the quick-access bar
   topicRoles: {}, // topicId -> { role: 'focus'|'marker'|'influence', dir, timing }
   topicGoals: {}, // topicId -> { metric, cmp, target, period, since }
+  topicPrefs: {},
+  dayChecks: {},
+  activeTimers: {},
+  eventsByTopic: new Map(),
+  latestByTopic: new Map(),
+  backup: {},
   insightSettings: null,
   insights: null,           // cached result of CWINSIGHTS.analyze()
   insightsDirty: true,      // recompute on next Insights render
@@ -79,7 +88,7 @@ function parseDateTimeInput(dateStr, timeStr) {
 
 function relativeFromNow(ts) {
   const now = Date.now();
-  const delta = now - ts;
+  const delta = Math.max(0, now - ts);
   const sec = Math.floor(delta / 1000);
   const min = Math.floor(sec / 60);
   const hr  = Math.floor(min / 60);
@@ -136,7 +145,7 @@ function fmtQant(qant, topic) {
   }
   // unit-based: raw number + symbol
   const sym = m.symbol || '';
-  return `${qant}${sym}`;
+  return `${qant}${sym ? ' ' + sym : ''}`;
 }
 
 /* Infer a topic kind from its measurement when no explicit kind set. */
@@ -156,7 +165,9 @@ function topicKind(topic) {
 
 async function reload() {
   const [topics, events, measurements, favIds, topicKinds, topicMeta,
-         topicRoles, insightSettings, topicGoals] = await Promise.all([
+         topicRoles, insightSettings, topicGoals, topicPrefs, dayChecks,
+         activeTimers, lastExport, lastDriveSync, lastLocalChangeAt, driveEnabled,
+         reorderHintHidden] = await Promise.all([
     CWDB.getAll('topics'),
     CWDB.getAll('events'),
     CWDB.getAll('measurements'),
@@ -166,32 +177,51 @@ async function reload() {
     CWDB.getTopicRoles(),
     CWDB.getInsightSettings(),
     CWDB.getTopicGoals(),
+    CWDB.getMeta('topicPrefs', {}),
+    CWDB.getMeta('dayChecks', {}),
+    CWDB.getMeta('activeTimers', {}),
+    CWDB.getMeta('lastExport', 0),
+    CWDB.getMeta('lastDriveSync', 0),
+    CWDB.getMeta('lastLocalChangeAt', 0),
+    CWDB.getMeta('driveEnabled'),
+    CWDB.getMeta('reorderHintHidden', false),
   ]);
   const savedOrder = (await CWDB.getMeta('topicOrder')) || [];
   const knownIds = new Set(topics.map((t) => t.id));
-  const orderedKnown = savedOrder.filter((id) => knownIds.has(id));
+  const orderedKnown = [...new Set(savedOrder.filter((id) => knownIds.has(id)))];
   const orderedSet = new Set(orderedKnown);
   const rest = topics
     .filter((t) => !orderedSet.has(t.id))
     .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
     .map((t) => t.id);
   const finalOrder = [...orderedKnown, ...rest];
-  const orderChanged =
-    finalOrder.length !== savedOrder.length ||
-    finalOrder.some((id, i) => savedOrder[i] !== id);
-  if (orderChanged) {
-    await CWDB.setMeta('topicOrder', finalOrder);
-  }
   state.topicOrder = finalOrder;
   const byId = new Map(topics.map((t) => [t.id, t]));
   state.topics = finalOrder.map((id) => byId.get(id)).filter(Boolean);
   state.events = events;
+  state.eventsByTopic = new Map();
+  state.latestByTopic = new Map();
+  for (const event of events) {
+    if (!state.eventsByTopic.has(event.topicid)) state.eventsByTopic.set(event.topicid, []);
+    state.eventsByTopic.get(event.topicid).push(event);
+    const previous = state.latestByTopic.get(event.topicid);
+    if (!previous || previous.time < event.time) state.latestByTopic.set(event.topicid, event);
+  }
   state.measurements = measurements;
   state.favorites = new Set(favIds);
-  state.topicKinds = topicKinds || {};
+  state.topicKinds = { ...(topicKinds || {}) };
+  for (const topic of state.topics) {
+    if (!state.topicKinds[topic.id]) state.topicKinds[topic.id] = inferKind(topic);
+  }
   state.topicMeta = topicMeta || {};
   state.topicRoles = topicRoles || {};
   state.topicGoals = topicGoals || {};
+  state.topicPrefs = topicPrefs || {};
+  state.dayChecks = dayChecks || {};
+  state.activeTimers = activeTimers || {};
+  state.backup = { lastExport, lastDriveSync, lastLocalChangeAt,
+    driveEnabled: driveEnabled ?? !!lastDriveSync };
+  state.reorderHintHidden = reorderHintHidden;
   state.insightSettings = insightSettings;
   state.insightsDirty = true;
   // Quick-access bar: keep only ids that still map to existing, non-archived topics.
@@ -221,17 +251,18 @@ async function saveTopicOrder(orderIds) {
   queueAutoSync();
 }
 
-/* Evaluates a topic's goal against its events, or null when it has none.
- * Deliberately stateless — it reads live state.events every time, so a freshly
- * logged event moves the streak immediately with no cache to invalidate. */
+/* The per-topic event index is rebuilt after each committed mutation. */
 function goalFor(topic) {
   const goal = topic && state.topicGoals?.[topic.id];
   if (!goal) return null;
   return CWGOALS.evaluate({
-    events: state.events.filter((e) => e.topicid === topic.id),
+    events: state.eventsByTopic.get(topic.id) || [],
     goal,
     kind: topicKind(topic),
     cutoffHour: insightsSettings().cutoffHour,
+    topicPrefs: state.topicPrefs,
+    topicId: topic.id,
+    dayChecks: state.dayChecks,
   });
 }
 
@@ -240,12 +271,117 @@ function topicMeasurement(topic) {
 }
 
 function lastEventForTopic(topicid) {
-  let best = null;
-  for (const e of state.events) {
-    if (e.topicid !== topicid) continue;
-    if (!best || e.time > best.time) best = e;
+  return state.latestByTopic.get(topicid) || null;
+}
+
+function logicalDay(ts = Date.now()) {
+  return CWINSIGHTS.dayKey(ts, insightsSettings().cutoffHour);
+}
+
+function dayBounds(key) {
+  const cutoff = insightsSettings().cutoffHour;
+  return [CWSTATS.dayBoundary(key, cutoff), CWSTATS.dayBoundary(CWSTATS.addDays(key, 1), cutoff)];
+}
+
+function topicPrefs(topic) {
+  return state.topicPrefs[topic.id] || {};
+}
+
+function measurementsByTopic() {
+  const byId = new Map(state.measurements.map((measurement) => [measurement.id, measurement]));
+  return Object.fromEntries(state.topics.map((topic) => [topic.id, byId.get(topic.msureid) || {}]));
+}
+
+function measuredValue(events, topic) {
+  if (!events.length) return null;
+  const aggregation = topicKind(topic) === 'amount' ? topicPrefs(topic).aggregation || 'sum' : 'sum';
+  if (aggregation === 'latest') {
+    return Number(events.reduce((latest, event) => event.time >= latest.time ? event : latest).qant || 0);
   }
-  return best;
+  const total = events.reduce((sum, event) => sum + Number(event.qant || 0), 0);
+  return total / (aggregation === 'mean' ? events.length : 1);
+}
+
+function backupHealthHtml() {
+  const backup = state.backup;
+  const latest = Math.max(backup.lastExport || 0, backup.lastDriveSync || 0);
+  const pending = latest && backup.lastLocalChangeAt > latest;
+  const text = !latest ? 'Not backed up yet'
+    : pending ? 'Changes waiting for backup'
+    : `Last ${backup.lastDriveSync >= backup.lastExport ? 'synced' : 'exported'} ${fmtDateLong(latest)}`;
+  return `<div class="backup-health"><span>${escapeHtml(text)}</span>
+    <button class="btn secondary small" id="backupHealthAction">${backup.driveEnabled ? 'Sync now' : 'Back up'}</button></div>`;
+}
+
+function bindBackupHealth() {
+  bindAction($('#backupHealthAction'), async () => {
+    if (state.backup.driveEnabled) {
+      const result = await CWDRIVE.syncNow({ interactive: true });
+      await CWDRIVE.afterSync(result);
+      await reload(); renderCurrent();
+    } else openDrive();
+  });
+}
+
+function dayCheckHtml(key) {
+  const date = fmtDateInput(key);
+  const current = state.dayChecks[date] || '';
+  return `<div class="today-checkin">
+    <label for="dayCheck">Logging for ${escapeHtml(fmtDateLong(key))}</label>
+    <select id="dayCheck">
+      <option value="" ${!current ? 'selected' : ''}>Not confirmed</option>
+      <option value="complete" ${current === 'complete' ? 'selected' : ''}>Logged everything</option>
+      <option value="none" ${current === 'none' ? 'selected' : ''}>Nothing happened</option>
+      <option value="incomplete" ${current === 'incomplete' ? 'selected' : ''}>Incomplete / missed logging</option>
+    </select>
+    <p class="muted-small">Missing logs are not proof that nothing happened. This check-in covers all topics.</p>
+  </div>`;
+}
+
+function bindDayCheck(key) {
+  bindAction($('#dayCheck'), async (event) => {
+    const value = event.target.value;
+    const [start, end] = dayBounds(key);
+    if (value === 'none' && state.events.some((e) => e.time >= start && e.time < end)) {
+      throw new Error('This day has entries. Choose "Logged everything" or "Incomplete" instead.');
+    }
+    const checks = { ...state.dayChecks };
+    const date = fmtDateInput(key);
+    if (value) checks[date] = value;
+    else delete checks[date];
+    await CWDB.setMeta('dayChecks', checks);
+  }, { event: 'change', mutation: true });
+}
+
+function timerHtml(topic) {
+  const started = state.activeTimers[topic.id];
+  if (!started) return '';
+  return `<div class="timer-panel"><span data-timer-start="${started}">${escapeHtml(CWSTATS.fmtIntervalShort(Date.now() - started))} running</span>
+    <button type="button" class="btn secondary small" data-stop-timer="${topic.id}">Stop &amp; save</button></div>`;
+}
+
+async function startTimer(topic) {
+  const started = Date.now();
+  await CWMODEL.mutate(() => CWDB.startTimer(topic.id, started));
+  snack(`Timer started for ${topic.name}`);
+}
+
+async function stopTimer(topic) {
+  const stopped = Date.now();
+  await CWMODEL.mutate(async () => {
+    const event = await CWDB.finishTimer(topic.id, stopped);
+    snack(`Saved ${topic.name} timer`, { undo: () => CWMODEL.mutate(() => CWDB.delete('events', event.id)) });
+  });
+}
+
+function refreshLiveLabels() {
+  $$('[data-elapsed]').forEach((element) => {
+    const rel = relativeFromNow(Number(element.dataset.elapsed));
+    element.innerHTML = `<div class="big">${rel.big}</div><div class="small">${rel.small}</div>`;
+  });
+  $$('[data-timer-start]').forEach((element) => {
+    element.textContent = `${CWSTATS.fmtIntervalShort(Date.now() - Number(element.dataset.timerStart))} running`;
+  });
 }
 
 /* ======== VIEW: CATEGORIES (default home) ======== */
@@ -299,13 +435,17 @@ function renderCategories() {
   const topics = state.topics.filter((t) => !t.archived);
   if (!topics.length) {
     main.innerHTML = `
+      ${backupHealthHtml()}
       ${welcomeBannerHtml()}
       <div class="empty">
-        <p>No topics yet.</p>
+        <p>${state.topics.length ? 'All topics are archived. Your history is still saved.' : 'No topics yet.'}</p>
         <button class="btn" id="emptyAddTopic">Add a topic</button>
+        ${state.topics.length ? '<button class="btn secondary" id="emptyManage">Manage topics</button>' : ''}
       </div>`;
+    bindBackupHealth();
     bindWelcomeBanner();
     $('#emptyAddTopic')?.addEventListener('click', () => openTopicEdit(null));
+    $('#emptyManage')?.addEventListener('click', openTopicsManager);
     return;
   }
 
@@ -318,7 +458,7 @@ function renderCategories() {
         const color = topicColor(f.topic);
         return `<button class="quick-chip" data-quick="${f.id}" style="--accent:${color}">
           ${emoji ? `<span class="qc-emoji">${escapeHtml(emoji)}</span>` : ''}
-          <span class="qc-name">+ ${escapeHtml(f.topic.name)}</span>
+          <span class="qc-name">${escapeHtml(quickLabel(f.topic))}</span>
         </button>`;
       }).join('')}
     </div>` : '';
@@ -333,7 +473,7 @@ function renderCategories() {
       : '<em>no entries yet</em>';
     return `
       <div class="card" data-topic="${t.id}" style="--accent:${color}">
-        <div class="delta">
+        <div class="delta" ${last ? `data-elapsed="${last.time}"` : ''}>
           ${rel ? `<div class="big">${rel.big}</div><div class="small">${rel.small}</div>` : `<div class="small">—</div>`}
         </div>
         <div>
@@ -341,27 +481,39 @@ function renderCategories() {
           ${t.desc ? `<div class="desc">${escapeHtml(t.desc)}</div>` : ''}
           <div class="last">${lastLine}</div>
           ${goalChipHtml(t)}
+          ${timerHtml(t)}
         </div>
         <div class="actions">
-          <button class="add-btn" data-add="${t.id}">ADD</button>
+          <button class="add-btn" data-add="${t.id}" aria-label="Log ${escapeHtml(t.name)}">Log…</button>
         </div>
       </div>
     `;
   }).join('');
 
   main.innerHTML = `
+    ${backupHealthHtml()}
     ${quickBar}
-    <div class="reorder-hint">Tap ADD to log. Long-press a card to drag-reorder. Rename / change type / delete in ☰ → Manage Topics.</div>
+    ${state.reorderHintHidden ? '' : '<div class="reorder-hint">Log an entry, or long-press a card to reorder. Edit topics in Menu → Manage topics. <button class="btn secondary small" id="hideReorderHint">Got it</button></div>'}
+    ${dayCheckHtml(logicalDay())}
     <div id="categoriesList">${html}</div>
     <button class="new-topic-tile" id="addTopicBtn">+ New topic</button>
   `;
+  bindBackupHealth();
+  bindDayCheck(logicalDay());
+  bindAction($('#hideReorderHint'), async () => {
+    await CWDB.setMeta('reorderHintHidden', true);
+    state.reorderHintHidden = true;
+    renderCategories();
+  });
+  $$('[data-stop-timer]').forEach((button) => bindAction(button, () =>
+    stopTimer(state.topics.find((topic) => topic.id === Number(button.dataset.stopTimer)))));
 
   // Quick-bar one-tap log
   $$('[data-quick]').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
+    bindAction(btn, (e) => {
       const id = Number(e.currentTarget.dataset.quick);
       const topic = state.topics.find((t) => t.id === id);
-      if (topic) logNow(topic);
+      if (topic) return logNow(topic);
     });
   });
 
@@ -384,7 +536,7 @@ function renderCategories() {
   });
 
   attachReorder($('#categoriesList'), (newOrderIds) => {
-    saveTopicOrder(newOrderIds);
+    CWMODEL.mutate(() => saveTopicOrder(newOrderIds)).catch(reportError);
   });
 
   $('#addTopicBtn').addEventListener('click', () => openTopicEdit(null));
@@ -396,13 +548,23 @@ function renderCategories() {
 function goalChipHtml(topic) {
   const res = goalFor(topic);
   if (!res) return '';
-  const g = res.goal;
+  const g = res.activeGoal || res.goal;
   const m = topicMeasurement(topic);
   const unit = CWGOALS.PERIODS.find((p) => p.key === g.period);
   const noun = res.current === 1 ? unit.label : unit.plural;
 
   let cls, icon, text;
-  if (g.cmp === 'lte' && !res.met) {
+  const currentPeriod = res.periods[res.periods.length - 1];
+  if (currentPeriod?.paused || currentPeriod?.status === 'paused') {
+    cls = 'open'; icon = '⏸';
+    text = 'This period is paused';
+  } else if (currentPeriod?.partial || currentPeriod?.status === 'partial') {
+    cls = 'open'; icon = '○';
+    text = 'Partial period — not rated';
+  } else if (currentPeriod?.status === 'unknown') {
+    cls = 'open'; icon = '○';
+    text = 'Confirm logging to assess this period';
+  } else if (g.cmp === 'lte' && !res.met) {
     cls = 'miss'; icon = '⚠️';
     text = `Over limit — ${escapeHtml(CWGOALS.fmtValue(res.value, g, m))} (max ${escapeHtml(CWGOALS.fmtValue(g.target, g, m))})`;
   } else if (res.pending) {
@@ -415,7 +577,7 @@ function goalChipHtml(topic) {
     cls = res.current >= 3 ? 'hot' : 'ok';
     icon = res.current >= 3 ? '🔥' : '✅';
     text = res.current
-      ? `${res.current} ${noun}${g.cmp === 'lte' ? ' within limit' : ' in a row'}`
+      ? `${res.current} ${res.excludedPeriods ? 'observed ' : ''}${noun}${g.cmp === 'lte' ? ' within limit' : res.excludedPeriods ? ' meeting goal' : ' in a row'}`
       : 'Goal met';
   }
   return `<button class="goal-chip ${cls}" data-goal="${topic.id}"><span>${icon}</span>${text}</button>`;
@@ -525,12 +687,12 @@ function renderRecent() {
   let filtered = state.events;
   if (f.topic) filtered = filtered.filter((e) => e.topicid === Number(f.topic));
   if (f.from) {
-    const fromMs = new Date(f.from + 'T00:00:00').getTime();
+    const fromMs = dayBounds(new Date(f.from + 'T00:00:00').getTime())[0];
     filtered = filtered.filter((e) => e.time >= fromMs);
   }
   if (f.to) {
-    const toMs = new Date(f.to + 'T23:59:59.999').getTime();
-    filtered = filtered.filter((e) => e.time <= toMs);
+    const toMs = dayBounds(new Date(f.to + 'T00:00:00').getTime())[1];
+    filtered = filtered.filter((e) => e.time < toMs);
   }
   if (f.q) {
     const q = f.q.toLowerCase();
@@ -565,7 +727,7 @@ function renderRecent() {
       const qant = t ? fmtQant(e.qant, t) : e.qant;
       const emoji = t ? topicEmoji(t) : '';
       return `
-        <div class="recent-row" data-event="${e.id}">
+        <div class="recent-row" data-event="${e.id}" role="button" tabindex="0" aria-label="Edit ${escapeHtml(name)}, ${escapeHtml(fmtDateLong(e.time))}">
           <div>
             <div class="r-name">${emoji ? `<span class="card-emoji">${escapeHtml(emoji)}</span>` : ''}${escapeHtml(name)} ${severityBadge(e)}</div>
             <div class="r-when">${fmtDateLong(e.time)} <small>${fmtTime(e.time)}</small></div>
@@ -603,10 +765,13 @@ function renderRecent() {
       renderList();
     });
     $$('.recent-row').forEach((row) => {
+      row.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); row.click(); }
+      });
       row.addEventListener('click', () => {
         const id = Number(row.dataset.event);
         const e = state.events.find((x) => x.id === id);
-        const t = topicById.get(e.topicid);
+        const t = topicById.get(e?.topicid);
         if (t && e) openAddEvent(t, e);
       });
     });
@@ -628,6 +793,7 @@ function renderRecent() {
       state.recentFilter = { ...state.recentFilter, tag: b.dataset.tagFilter };
       renderRecent();
     }));
+    CWUI.labelControls(main);
   };
   renderList();
 }
@@ -636,16 +802,11 @@ function renderRecent() {
 
 function renderDay() {
   const main = $('#main');
-  if (!state.events.length) {
-    main.innerHTML = `${welcomeBannerHtml()}<div class="empty">No events yet — log something to start.</div>`;
-    bindWelcomeBanner();
-    return;
-  }
-  if (!state.dayDate) state.dayDate = CWSTATS.startOfDay(Date.now());
+  if (state.dayDate == null) state.dayDate = logicalDay();
   const day = state.dayDate;
-  const nextDay = day + 86400000;
+  const [dayStart, nextDay] = dayBounds(day);
   const events = state.events
-    .filter((e) => e.time >= day && e.time < nextDay)
+    .filter((e) => e.time >= dayStart && e.time < nextDay)
     .sort((a, b) => a.time - b.time);
 
   const topicById = new Map(state.topics.map((t) => [t.id, t]));
@@ -663,8 +824,8 @@ function renderDay() {
 
   const dateStr = fmtDateLong(day);
   const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(day).getDay()];
-  const isToday = day === CWSTATS.startOfDay(Date.now());
-  const todayLabel = isToday ? 'Today' : (day === CWSTATS.startOfDay(Date.now() - 86400000) ? 'Yesterday' : '');
+  const isToday = day === logicalDay();
+  const todayLabel = isToday ? 'Today' : (day === CWINSIGHTS.addDays(logicalDay(), -1) ? 'Yesterday' : '');
 
   // Chronological list
   const chronoHtml = events.map((e) => {
@@ -673,7 +834,7 @@ function renderDay() {
     const emoji = t ? topicEmoji(t) : '';
     const q = t ? fmtQant(e.qant, t) : e.qant;
     return `
-      <div class="day-event" data-event="${e.id}">
+      <div class="day-event" data-event="${e.id}" role="button" tabindex="0" aria-label="Edit ${escapeHtml(name)} at ${escapeHtml(fmtTime(e.time))}">
         <div class="day-time">${fmtTime(e.time)}</div>
         <div class="day-info">
           <div class="day-name">${emoji ? `<span class="card-emoji">${escapeHtml(emoji)}</span>` : ''}${escapeHtml(name)} ${severityBadge(e)}</div>
@@ -691,8 +852,8 @@ function renderDay() {
     const kind = topicKind(t);
     let qantSummary = '';
     if (kind === 'amount' || kind === 'duration') {
-      const sum = g.evs.reduce((s, e) => s + Number(e.qant || 0), 0);
-      qantSummary = ` · sum ${escapeHtml(fmtQant(sum, t))}`;
+      const label = kind === 'amount' ? topicPrefs(t).aggregation || 'sum' : 'sum';
+      qantSummary = ` · ${label} ${escapeHtml(fmtQant(measuredValue(g.evs, t), t))}`;
     }
     const times = g.evs.map((e) => fmtTime(e.time)).join(', ');
     return `
@@ -713,8 +874,10 @@ function renderDay() {
         ${todayLabel ? `<div class="dt-sub">${todayLabel}</div>` : ''}
       </div>
       <button class="icon-btn day-next" id="dayNext" aria-label="Next day" ${isToday ? 'disabled' : ''}>›</button>
-      <input type="date" id="dayPick" value="${fmtDateInput(day)}">
+      <input type="date" id="dayPick" aria-label="Choose day" max="${fmtDateInput(logicalDay())}" value="${fmtDateInput(day)}">
     </div>
+    <p class="muted-small">Day runs from ${escapeHtml(CWINSIGHTS.fmtHour(insightsSettings().cutoffHour))} to the same time tomorrow.</p>
+    ${dayCheckHtml(day)}
     <div class="day-stats-strip">
       <div><b>${events.length}</b><span>events</span></div>
       <div><b>${groups.length}</b><span>topics</span></div>
@@ -724,29 +887,35 @@ function renderDay() {
     <div class="day-section-h">Timeline</div>
     ${chronoHtml}
   `;
+  bindDayCheck(day);
 
   $('#dayPrev').addEventListener('click', () => {
-    state.dayDate = state.dayDate - 86400000;
+    state.dayDate = CWINSIGHTS.addDays(state.dayDate, -1);
     renderDay();
   });
   $('#dayNext').addEventListener('click', () => {
-    state.dayDate = Math.min(state.dayDate + 86400000, CWSTATS.startOfDay(Date.now()));
+    state.dayDate = Math.min(CWINSIGHTS.addDays(state.dayDate, 1), logicalDay());
     renderDay();
   });
   $('#dayPick').addEventListener('change', (e) => {
     const v = e.target.value;
     if (v) {
       const [y, mo, d] = v.split('-').map(Number);
-      state.dayDate = new Date(y, mo - 1, d).getTime();
+      state.dayDate = Math.min(new Date(y, mo - 1, d).getTime(), logicalDay());
       renderDay();
     }
   });
-  $$('.day-event').forEach((row) => row.addEventListener('click', () => {
+  $$('.day-event').forEach((row) => {
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); row.click(); }
+    });
+    row.addEventListener('click', () => {
     const id = Number(row.dataset.event);
     const ev = state.events.find((x) => x.id === id);
     const t = topicById.get(ev?.topicid);
     if (ev && t) openAddEvent(t, ev);
-  }));
+    });
+  });
 }
 
 /* ======== VIEW: STATISTICS (per-topic detail) ======== */
@@ -767,15 +936,20 @@ function renderStats() {
     return;
   }
   const topics = state.topics.filter((t) => !t.archived);
+  if (!topics.length) {
+    main.innerHTML = '<div class="empty"><p>All your topics are archived. Your history is still saved.</p><button class="btn" id="manageArchived">Manage topics</button></div>';
+    $('#manageArchived').addEventListener('click', openTopicsManager);
+    return;
+  }
   if (state.statsTopicId == null || !topics.find((t) => t.id === state.statsTopicId)) {
     state.statsTopicId = topics[0]?.id;
   }
   const topic = topics.find((t) => t.id === state.statsTopicId);
-  const events = state.events.filter((e) => e.topicid === topic.id);
+  const events = state.eventsByTopic.get(topic.id) || [];
   const measurement = state.measurements.find((m) => m.id === topic?.msureid);
   const kind = topicKind(topic);
   const isMeasurable = kind === 'amount' || kind === 'duration';
-  const totalQant = events.reduce((s, e) => s + Number(e.qant || 0), 0);
+  const totalQant = measuredValue(events, topic);
   const totalQantStr = isMeasurable ? fmtQant(totalQant, topic) : '';
 
   // Build the top selector + period tabs
@@ -791,7 +965,7 @@ function renderStats() {
       <div><b>${CWSTATS.fmtIntervalShort(iv.min)}</b><span>min</span></div>
       <div><b>${CWSTATS.fmtIntervalShort(iv.max)}</b><span>max</span></div>
       <div><b>${CWSTATS.fmtIntervalShort(iv.last)}</b><span>since last</span></div>
-      ${isMeasurable ? `<div><b>${escapeHtml(totalQantStr)}</b><span>total</span></div>` : ''}
+      ${isMeasurable ? `<div><b>${escapeHtml(totalQantStr)}</b><span>${escapeHtml(kind === 'amount' ? topicPrefs(topic).aggregation || 'sum' : 'total')}</span></div>` : ''}
     </div>` : `<div class="stats-cards"><div><b>${events.length}</b><span>events</span></div></div>`;
 
   // Cross-topic correlations
@@ -814,12 +988,12 @@ function renderStats() {
       <button class="tab" data-period="monthly" aria-selected="${state.statsPeriod==='monthly'}">Monthly</button>
     </div>
     <div class="stats-bar">
-      <select id="statsTopic">${topOpts}</select>
+      <label class="sr-only" for="statsTopic">Topic</label><select id="statsTopic">${topOpts}</select>
     </div>
     ${intervalSummary}
 
-    <div class="stats-section">
-      <h3>Count over time</h3>
+    <div class="stats-grid"><div class="stats-section">
+      <h3>${kind === 'timeonly' ? 'Count' : escapeHtml(topicPrefs(topic).aggregation || 'sum')} over time</h3>
       <div class="chart-wrap"><canvas id="chartOverTime"></canvas></div>
     </div>
 
@@ -840,10 +1014,10 @@ function renderStats() {
 
     ${corrRows ? `
       <div class="stats-section">
-        <h3>Correlated topics (within 24h)</h3>
+        <h3>Nearby topics (within 24h)</h3>
         <p class="muted-small">For each event of <em>${escapeHtml(topic.name)}</em>, the nearest event of another topic within 24 hours.</p>
         ${corrRows}
-      </div>` : ''}
+      </div>` : ''}</div>
   `;
 
   $$('#periodTabs .tab').forEach((tb) => {
@@ -880,13 +1054,14 @@ function renderGoalSection(topic) {
       <button class="btn secondary small" id="editGoal">Set a goal</button>
     </div>`;
   }
-  const g = res.goal;
+  const g = res.activeGoal || res.goal;
   const unit = CWGOALS.PERIODS.find((p) => p.key === g.period);
   const dots = res.periods.slice(-30).map((p) => {
-    const cls = p.pending ? 'pending' : p.met ? 'met' : 'miss';
+    const cls = p.paused ? 'paused' : p.partial ? 'partial' : p.status === 'unknown' ? 'unknown'
+      : p.pending ? 'pending' : p.met ? 'met' : 'miss';
     const when = p.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-    const label = `${when}: ${CWGOALS.fmtValue(p.value, g, m)}`;
-    return `<span class="goal-dot ${cls}" title="${escapeHtml(label)}"></span>`;
+    const label = `${when}: ${CWGOALS.fmtValue(p.value, g, m)} (${cls})`;
+    return `<span class="goal-dot ${cls}" role="img" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}"></span>`;
   }).join('');
 
   const rate = res.rate == null ? '—' : `${Math.round(res.rate * 100)}%`;
@@ -899,6 +1074,8 @@ function renderGoalSection(topic) {
     <p class="muted-small">${escapeHtml(CWGOALS.describeGoal(g, m))} ·
       currently ${escapeHtml(CWGOALS.fmtValue(res.value, g, m))}
       ${g.period === 'day' ? 'today' : 'this week'}</p>
+    ${['metric', 'target', 'cmp', 'period'].some((key) => g[key] !== res.goal[key])
+      ? `<p class="muted-small">Next period: ${escapeHtml(CWGOALS.describeGoal(res.goal, m))}</p>` : ''}
     <div class="stats-cards goal-cards">
       <div><b>${res.current}</b><span>current ${nounNow}</span></div>
       <div><b>${res.best}</b><span>best ${nounBest}</span></div>
@@ -906,6 +1083,7 @@ function renderGoalSection(topic) {
       <div><b>${res.metRecent}</b><span>met</span></div>
     </div>
     <div class="goal-dots">${dots}</div>
+    <p class="muted-small">Paused, incomplete and partial periods are shown separately and excluded from the completion rate.</p>
     <button class="btn secondary small" id="editGoal">Edit goal</button>
   </div>`;
 }
@@ -921,30 +1099,34 @@ const CHART = {
 };
 function applyChartTheme() {
   if (typeof Chart === 'undefined') return;
-  const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches;
-  Chart.defaults.color = dark ? '#a2abc2' : '#5f6880';
-  Chart.defaults.borderColor = dark ? '#2a3247' : '#e4e8f2';
+  CWCHARTS.theme();
 }
 
 function drawOverTime(events, topic) {
   const canvas = $('#chartOverTime');
   if (!canvas) return;
-  const rows = CWSTATS.aggregate(events, state.statsPeriod);
-  const cutoff = { daily: 30, weekly: 12, monthly: 12 }[state.statsPeriod];
-  const slice = rows.slice(0, cutoff).reverse();
-  const labels = slice.map((r) => CWSTATS.labelFor(state.statsPeriod, r.bucket));
-  const counts = slice.map((r) => r.count);
-  applyChartTheme();
-  state.charts.overTime = new Chart(canvas, {
-    type: 'bar',
-    data: { labels, datasets: [{ label: 'count', data: counts, backgroundColor: CHART.primary, borderRadius: 4 }] },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
-    },
+  const cutoffHour = insightsSettings().cutoffHour;
+  let start = logicalDay();
+  if (state.statsPeriod === 'daily') start = CWINSIGHTS.addDays(start, -29);
+  if (state.statsPeriod === 'weekly') start = CWINSIGHTS.addDays(CWSTATS.startOfWeek(Date.now(), cutoffHour), -77);
+  if (state.statsPeriod === 'monthly') {
+    const month = new Date(CWSTATS.startOfMonth(Date.now(), cutoffHour));
+    month.setMonth(month.getMonth() - 11);
+    start = month.getTime();
+  }
+  const kind = topicKind(topic);
+  const aggregation = kind === 'amount' ? topicPrefs(topic).aggregation || 'sum' : 'sum';
+  const rows = CWSTATS.aggregate(events, state.statsPeriod, {
+    cutoffHour, start: dayBounds(start)[0], end: Date.now(), fill: true, aggregation,
   });
+  const slice = rows.slice().reverse();
+  const labels = slice.map((r) => CWSTATS.labelFor(state.statsPeriod, r.bucket));
+  const values = slice.map((row) => kind === 'timeonly' ? row.count
+    : row.value == null ? null : row.value / (kind === 'duration' ? 60 : 1));
+  const unit = kind === 'duration' ? 'min' : topicMeasurement(topic)?.symbol || '';
+  const label = kind === 'timeonly' ? 'Count' : `${aggregation} ${unit}`.trim();
+  state.charts.overTime = CWCHARTS.bar(canvas, { labels, values, label,
+    color: CHART.primary, integer: kind === 'timeonly' });
 }
 
 function drawTimeOfDay(events) {
@@ -952,41 +1134,23 @@ function drawTimeOfDay(events) {
   if (!canvas) return;
   const buckets = CWSTATS.timeOfDay(events);
   const labels = buckets.map((_, i) => `${i}`);
-  applyChartTheme();
-  state.charts.tod = new Chart(canvas, {
-    type: 'bar',
-    data: { labels, datasets: [{ label: 'count', data: buckets, backgroundColor: CHART.violet, borderRadius: 4 }] },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: { x: { title: { display: true, text: 'hour' } }, y: { beginAtZero: true, ticks: { precision: 0 } } },
-    },
-  });
+  state.charts.tod = CWCHARTS.bar(canvas, { labels, values: buckets, label: 'Count by hour',
+    color: CHART.violet, xTitle: 'Hour' });
 }
 
 function drawDayOfWeek(events) {
   const canvas = $('#chartDOW');
   if (!canvas) return;
-  const buckets = CWSTATS.dayOfWeek(events);
+  const buckets = CWSTATS.dayOfWeek(events, insightsSettings().cutoffHour);
   const labels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-  applyChartTheme();
-  state.charts.dow = new Chart(canvas, {
-    type: 'bar',
-    data: { labels, datasets: [{ label: 'count', data: buckets, backgroundColor: CHART.teal, borderRadius: 4 }] },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
-    },
-  });
+  state.charts.dow = CWCHARTS.bar(canvas, { labels, values: buckets,
+    label: 'Count by day of week', color: CHART.teal });
 }
 
 function drawHeatmap(events) {
   const root = $('#heatmap');
   if (!root) return;
-  const mat = CWSTATS.calendarMatrix(events, 26);
+  const mat = CWSTATS.calendarMatrix(events, 26, insightsSettings().cutoffHour);
   const maxC = Math.max(1, mat.maxCount);
   const heatLevel = (c) => {
     if (c === 0) return 0;
@@ -1002,7 +1166,8 @@ function drawHeatmap(events) {
       const cell = mat.weeks[w][d];
       const lvl = heatLevel(cell.count);
       const date = new Date(cell.date);
-      html += `<div class="heatmap-cell level-${lvl}" title="${date.toDateString()}: ${cell.count} event${cell.count===1?'':'s'}"></div>`;
+      const label = `${date.toDateString()}: ${cell.count} event${cell.count === 1 ? '' : 's'}`;
+      html += `<div class="heatmap-cell level-${lvl}" role="img" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}"></div>`;
     }
     html += '</div>';
   }
@@ -1036,6 +1201,9 @@ function computeInsights(force = false) {
     topics: state.topics,
     roles: state.topicRoles,
     kinds: state.topicKinds,
+    topicPrefs: state.topicPrefs,
+    dayChecks: state.dayChecks,
+    measurements: measurementsByTopic(),
     cutoffHour: s.cutoffHour,
     windowDays: s.windowDays,
     insightWindow: s.insightWindow,
@@ -1093,9 +1261,10 @@ function renderInsights() {
   const meta = STATUS_META[status.level] || STATUS_META.unknown;
 
   const metricChips = status.metrics.map((m) => {
-    const arrow = m.worse ? '▲' : '▼';
+    const arrow = m.current > m.baseline ? '▲' : m.current < m.baseline ? '▼' : '—';
     const cls = m.elevated ? 'bad' : m.improved ? 'good' : '';
-    const pct = isFinite(m.pct) ? `${m.pct >= 0 ? '+' : ''}${Math.round(m.pct)}%` : '';
+    const pct = Number.isFinite(m.pct) ? `${m.pct >= 0 ? '+' : ''}${Math.round(m.pct)}%`
+      : m.baseline === 0 && m.current > 0 ? 'from none' : 'no percentage baseline';
     return `<div class="metric ${cls}">
       <b>${N.fmtNum(m.current, m.digits)}<small>${escapeHtml(m.unit)}</small></b>
       <span>${escapeHtml(m.label)}</span>
@@ -1123,43 +1292,53 @@ function renderInsights() {
       </div>
     </div>`;
 
-  const insightItems = narrative.slice(0, 12).map((n) => `
+  const insightRow = (n) => `
     <li class="insight ${n.kind === 'test' ? 'is-test' : ''}">
       <span>${escapeHtml(n.text)}</span>
+      ${n.test ? `<span class="muted-small">Based on ${n.test.n} paired days</span>` : ''}
       ${n.sig ? sigBadge(n.sig) : ''}
-    </li>`).join('');
+    </li>`;
+  const insightItems = narrative.slice(0, 3).map(insightRow).join('');
+  const otherInsights = narrative.slice(3, 12).map(insightRow).join('');
+  const primary = primaryOutcome(res);
 
   main.innerHTML = `
     ${statusCard}
 
     <div class="stats-section">
-      <h3>${escapeHtml(focusName(table))} per day (last 120 days)</h3>
+      <h3>${escapeHtml(primary?.label || focusName(table))} (last 120 days)</h3>
       <div class="chart-wrap"><canvas id="chartInsTrend"></canvas></div>
     </div>
 
     <div class="stats-section">
       <h3>What stands out (last ${s.insightWindow} days)</h3>
+      ${res.window ? `<p class="muted-small">${escapeHtml(fmtDateLong(res.window.from))} – ${escapeHtml(fmtDateLong(res.window.to - 1))}</p>` : ''}
+      <p class="muted-small">Associations, not causes. Missing and incomplete days are excluded where observation is unknown.</p>
       ${insightItems
         ? `<ul class="insight-list">${insightItems}</ul>`
         : `<p class="muted-small">Not enough data yet — keep logging.</p>`}
+      ${otherInsights ? `<details class="insight-details"><summary>More observations</summary><ul class="insight-list">${otherInsights}</ul></details>` : ''}
       <p class="muted-small">“Significant” means it survived a false-discovery
       correction across every combination tested, and passed both a parametric
       and a rank-based test. Correlation still isn’t causation.</p>
+      ${res.dataQuality ? `<details class="analysis-details"><summary>Logging quality and assumptions</summary>
+        <p class="muted-small">${res.dataQuality.unknownDays} unknown days and ${res.dataQuality.incompleteDays} incomplete days in the recorded history.</p>
+        <p class="muted-small">${escapeHtml(res.dataQuality.assumption)}</p></details>` : ''}
     </div>
 
     ${renderTimingSection(timing, table)}
 
-    <div class="stats-section">
-      <h3>What moves the needle</h3>
+    <details class="stats-section analysis-details" id="explorerDetails" ${state.insExplorerOpen ? 'open' : ''}>
+      <summary>Explore all associations and statistical details</summary>
       <div class="stats-bar ins-controls">
-        <select id="insOutcome">${res.outcomes.map((o) =>
+        <select id="insOutcome" aria-label="Outcome">${res.outcomes.map((o) =>
           `<option value="${o.key}" ${o.key === state.insightOutcome ? 'selected' : ''}>${escapeHtml(o.label)}</option>`
         ).join('')}</select>
-        <select id="insLag">
+        <select id="insLag" aria-label="Association timing">
           <option value="0" ${state.insightLag === 0 ? 'selected' : ''}>same day</option>
           <option value="1" ${state.insightLag === 1 ? 'selected' : ''}>next day</option>
         </select>
-      </div>
+      </details>
       ${renderExplorer(res)}
     </div>
   `;
@@ -1172,7 +1351,14 @@ function renderInsights() {
   $('#insLag').addEventListener('change', (e) => {
     state.insightLag = Number(e.target.value); renderInsights();
   });
-  drawInsightsTrend(table);
+  $('#explorerDetails').addEventListener('toggle', (event) => { state.insExplorerOpen = event.target.open; });
+  drawInsightsTrend(table, primary);
+}
+
+function primaryOutcome(result) {
+  const id = result.table.focusIds[0];
+  return result.outcomes.find((outcome) => outcome.topicId === id && outcome.primary)
+    || result.outcomes.find((outcome) => outcome.topicId === id) || null;
 }
 
 /* Name of the primary focus topic, for headings. */
@@ -1187,7 +1373,7 @@ function renderTimingSection(timing, table) {
     return `<div class="stats-section">
       <h3>Timing</h3>
       <p class="muted-small">Tick <strong>“time of day matters”</strong> on a topic in
-      ⚙️ Topics &amp; settings to test whether doing it earlier or later changes
+      ⚙️ Topics &amp; settings to explore whether doing it earlier or later is associated with
       your day — meals, bedtime, first coffee, last screen.</p></div>`;
   }
   if (!timing.length) {
@@ -1196,16 +1382,13 @@ function renderTimingSection(timing, table) {
       <p class="muted-small">Not enough days where both were logged yet.</p></div>`;
   }
   const N = CWINSIGHTS;
-  const verdict = (q, p) => {
-    if (isFinite(q)) {
-      if (q < 0.05) return { txt: 'Yes', cls: 'sig-strong' };
-      if (q < 0.15) return { txt: 'Maybe', cls: 'sig-weak' };
-      return { txt: 'No clear effect', cls: 'sig-none' };
+  const verdict = (q) => {
+    if (Number.isFinite(q)) {
+      if (q < 0.05) return { txt: 'Association', cls: 'sig-strong' };
+      if (q < 0.15) return { txt: 'Suggestive', cls: 'sig-weak' };
+      return { txt: 'No clear association', cls: 'sig-none' };
     }
-    // Too few days for the corrected panel — judge on the raw p, conservatively.
-    if (!isFinite(p)) return { txt: 'Not enough data', cls: 'sig-none' };
-    if (p < 0.01) return { txt: 'Maybe (few days)', cls: 'sig-weak' };
-    return { txt: 'No clear effect', cls: 'sig-none' };
+    return { txt: 'Not enough data', cls: 'sig-none' };
   };
   const groups = {};
   for (const m of timing) {
@@ -1235,14 +1418,18 @@ function renderTimingSection(timing, table) {
         </div>
       </div>`;
     }).join('');
-    return `<div class="meal-card"><h4>Does a later <em>${escapeHtml(pred.toLowerCase())}</em> change…</h4>${body}</div>`;
-  }).join('');
+    return { supported: rows.some((row) => Number.isFinite(row.q) && row.q < 0.15),
+      html: `<div class="meal-card"><h4>Later <em>${escapeHtml(pred.toLowerCase())}</em> and…</h4>${body}</div>` };
+  });
+  const supported = cards.filter((card) => card.supported).map((card) => card.html).join('');
+  const remaining = cards.filter((card) => !card.supported).map((card) => card.html).join('');
 
   return `<div class="stats-section">
     <h3>Timing</h3>
     <p class="muted-small">Compares your latest third of days against your earliest
-    third for each time-of-day.</p>
-    ${cards}
+    third for each time-of-day, only on days that topic occurred. Each comparison has its own corrected result.</p>
+    ${supported || '<p class="muted-small">No clear timing associations in this window.</p>'}
+    ${remaining ? `<details class="analysis-details"><summary>Other timing comparisons</summary>${remaining}</details>` : ''}
   </div>`;
 }
 
@@ -1292,7 +1479,7 @@ function renderExplorer(res) {
     difference in means for yes/no predictors.</p>`;
 }
 
-function drawInsightsTrend(table) {
+function drawInsightsTrend(table, outcome) {
   const canvas = $('#chartInsTrend');
   if (!canvas) return;
   const tid = table.focusIds[0];
@@ -1300,17 +1487,21 @@ function drawInsightsTrend(table) {
   const days = table.days.slice(-120);
   if (days.length < 5) return;
   const labels = days.map((r) => `${r.date.getMonth() + 1}/${r.date.getDate()}`);
-  const counts = days.map((r) => r.counts[tid] || 0);
+  const counts = days.map((row) => outcome ? outcome.get(row) : row.counts[tid] ?? null);
+  canvas.setAttribute('role', 'img');
+  canvas.setAttribute('aria-label', `${outcome?.label || 'Daily trend'}. ${labels.map((label, index) =>
+    `${label}: ${counts[index] == null ? 'not observed' : counts[index]}`).join('; ')}`);
   const roll = CWINSIGHTS.rolling(counts, 7);
   const baseline = CWINSIGHTS.median(
-    table.days.slice(-97, -7).map((r) => r.counts[tid] || 0)
+    table.days.slice(-97, -7).map((row) => outcome ? outcome.get(row) : row.counts[tid] ?? null)
+      .filter(Number.isFinite)
   );
   applyChartTheme();
   state.charts.insTrend = new Chart(canvas, {
     data: {
       labels,
       datasets: [
-        { type: 'bar', label: 'per day', data: counts, backgroundColor: CHART.neutral, borderRadius: 3, order: 3 },
+        { type: 'bar', label: outcome?.label || 'per day', data: counts, backgroundColor: CHART.neutral, borderRadius: 3, order: 3 },
         { type: 'line', label: '7-day avg', data: roll, borderColor: CHART.primary,
           borderWidth: 2, pointRadius: 0, tension: 0.3, order: 1 },
         ...(isFinite(baseline) ? [{
@@ -1336,6 +1527,7 @@ function drawInsightsTrend(table) {
 
 function openRolesSetup() {
   const N = CWINSIGHTS;
+  const originalRoles = JSON.stringify(state.topicRoles);
   const cur = N.normalizeRoles(state.topicRoles || {});
   const roleOpts = (r) =>
     ['<option value="">— not used —</option>']
@@ -1391,6 +1583,11 @@ function openRolesSetup() {
         <div class="role-name">…until</div>
         <select id="insNightEnd">${nightOpts(s.nightEnd ?? 6)}</select>
       </div>
+      <div class="field">
+        <label for="insWindow">Association analysis window</label>
+        <select id="insWindow">${[30, 90, 180, 365].map((days) =>
+          `<option value="${days}" ${(s.insightWindow || 90) === days ? 'selected' : ''}>Last ${days} days</option>`).join('')}</select>
+      </div>
     </div>
     <div class="actions">
       <button class="btn secondary" data-close>Cancel</button>
@@ -1410,9 +1607,13 @@ function openRolesSetup() {
     });
   });
 
-  $('#saveRoles').addEventListener('click', async () => {
+  bindAction($('#saveRoles'), async ({ form, origin }) => {
+    if (JSON.stringify(state.topicRoles) !== originalRoles) {
+      throw new Error('Insight roles changed elsewhere. Close and reopen this editor before saving.');
+    }
+    const $ = (selector) => form.querySelector(selector);
     const map = {};
-    $$('[data-role-topic]').forEach((sel) => {
+    form.querySelectorAll('[data-role-topic]').forEach((sel) => {
       if (!sel.value) return;
       const id = Number(sel.dataset.roleTopic);
       const dir = $(`[data-role-dir="${id}"]`)?.value === 'up' ? 'up' : 'down';
@@ -1425,12 +1626,13 @@ function openRolesSetup() {
       cutoffHour: Number($('#insCutoff').value),
       nightStart: Number($('#insNightStart').value),
       nightEnd: Number($('#insNightEnd').value),
+      insightWindow: Number($('#insWindow').value),
     });
     state.insightsDirty = true;
-    closeModal();
+    closeModal({ origin });
     snack('Insights settings saved');
     setView('insights');
-  });
+  }, { mutation: true });
 }
 
 /* ---- goal editor ---- */
@@ -1439,9 +1641,16 @@ function openGoalEdit(topic) {
   const kind = topicKind(topic);
   const m = topicMeasurement(topic);
   const existing = CWGOALS.normalizeGoal(state.topicGoals?.[topic.id], kind);
+  const originalGoal = JSON.stringify(state.topicGoals?.[topic.id] ?? null);
+  const ensureCurrentGoal = () => {
+    if (JSON.stringify(state.topicGoals?.[topic.id] ?? null) !== originalGoal) {
+      throw new Error('This goal changed elsewhere. Close and reopen it before saving.');
+    }
+  };
   const g = existing || CWGOALS.suggestGoal(kind);
   const unit = CWGOALS.unitLabel(g, m);
   const unitWord = unit === '×' ? 'times' : unit;
+  const paused = !!existing?.pauses?.some((pause) => pause.to == null);
 
   openModal(`
     <header><button class="icon-btn" data-close>←</button>
@@ -1466,6 +1675,8 @@ function openGoalEdit(topic) {
         </select>
       </div>
       <p class="muted-small" id="goalPreview"></p>
+      ${existing ? `<p class="muted-small">Edits apply from the next period boundary; previous targets remain in your history. Paused periods do not add to or break a streak.</p>
+      <button class="btn secondary" id="goalPause">${paused ? 'Resume goal' : 'Pause goal'}</button>` : ''}
     </div>
     <div class="actions">
       ${existing ? `<button class="btn danger" id="goalRemove">Remove</button>` : ''}
@@ -1474,16 +1685,16 @@ function openGoalEdit(topic) {
     </div>
   `);
 
-  const read = () => ({
+  const read = (root = document) => ({
     metric: g.metric,
-    cmp: $('#goalCmp').value,
-    target: Number($('#goalTarget').value),
-    period: $('#goalPeriod').value,
+    cmp: root.querySelector('#goalCmp').value,
+    target: Number(root.querySelector('#goalTarget').value),
+    period: root.querySelector('#goalPeriod').value,
     since: existing ? existing.since : Date.now(),
   });
 
   const preview = () => {
-    const draft = CWGOALS.normalizeGoal(read(), kind);
+    const draft = CWGOALS.normalizeGoal(CWGOALS.reviseGoal(existing, read()), kind);
     const el = $('#goalPreview');
     if (!draft) {
       el.textContent = '“At least 0” would always pass — enter a target above zero.';
@@ -1492,6 +1703,7 @@ function openGoalEdit(topic) {
     const res = CWGOALS.evaluate({
       events: state.events.filter((e) => e.topicid === topic.id),
       goal: draft, kind, cutoffHour: insightsSettings().cutoffHour,
+      dayChecks: state.dayChecks, topicPrefs: state.topicPrefs, topicId: topic.id,
     });
     el.textContent = `${CWGOALS.describeGoal(draft, m)} — on your history so far, `
       + `that's ${CWGOALS.streakLine(res, m).toLowerCase()}`;
@@ -1503,23 +1715,31 @@ function openGoalEdit(topic) {
   });
   preview();
 
-  $('#goalSave').addEventListener('click', async () => {
-    const draft = CWGOALS.normalizeGoal(read(), kind);
+  bindAction($('#goalSave'), async ({ form, origin }) => {
+    ensureCurrentGoal();
+    const draft = CWGOALS.normalizeGoal(CWGOALS.reviseGoal(existing, read(form)), kind);
     if (!draft) { snack('Enter a target above zero'); return; }
     state.topicGoals = await CWDB.setTopicGoal(topic.id, draft);
-    closeModal();
+    closeModal({ origin });
     snack('Goal saved');
     queueAutoSync('saveGoal');
     renderCurrent();
-  });
+  }, { mutation: true });
 
-  $('#goalRemove')?.addEventListener('click', async () => {
+  bindAction($('#goalRemove'), async ({ origin }) => {
+    ensureCurrentGoal();
     state.topicGoals = await CWDB.setTopicGoal(topic.id, null);
-    closeModal();
+    closeModal({ origin });
     snack('Goal removed');
     queueAutoSync('removeGoal');
     renderCurrent();
-  });
+  }, { mutation: true });
+  bindAction($('#goalPause'), async ({ origin }) => {
+    ensureCurrentGoal();
+    state.topicGoals = await CWDB.setTopicGoal(topic.id, CWGOALS.setPaused(existing, !paused));
+    closeModal({ origin });
+    snack(paused ? 'Goal resumed' : 'Goal paused');
+  }, { mutation: true });
 }
 
 /* ---- alerts ---- */
@@ -1555,20 +1775,18 @@ function openAlertsDialog() {
       <button class="btn" id="alertSave">Save</button>
     </div>
   `);
-  $('#alertSave').addEventListener('click', async () => {
-    const enabled = $('#alertsOn').checked;
+  bindAction($('#alertSave'), async ({ form, origin }) => {
+    const enabled = form.querySelector('#alertsOn').checked;
+    const alertOn = form.querySelector('#alertOn').value;
     if (enabled && 'Notification' in window && Notification.permission === 'default') {
-      try { await Notification.requestPermission(); } catch (_) {}
+      await Notification.requestPermission();
     }
-    state.insightSettings = await CWDB.setInsightSettings({
-      alertsEnabled: enabled,
-      alertOn: $('#alertOn').value,
-    });
-    closeModal();
+    await CWMODEL.mutate(() => CWDB.setInsightSettings({ alertsEnabled: enabled, alertOn }));
+    closeModal({ origin });
     snack(enabled ? 'Status alerts on' : 'Status alerts off');
     if (state.view === 'insights') renderInsights();
   });
-  $('#alertTest').addEventListener('click', async () => {
+  bindAction($('#alertTest'), async () => {
     const res = computeInsights(true);
     await showStatusNotification(res.status, true);
     snack(`Current status: ${res.status.level}`);
@@ -1583,7 +1801,7 @@ async function showStatusNotification(status, isTest = false) {
     if ('Notification' in window && Notification.permission === 'granted') {
       const reg = await navigator.serviceWorker?.getRegistration?.();
       if (reg?.showNotification) {
-        await reg.showNotification(title, { body, tag: 'plotline-status', icon: 'icons/icon-192.png' });
+        await reg.showNotification(title, { body, tag: 'plotline-status', icon: '/icons/icon-192.png' });
       } else {
         new Notification(title, { body, tag: 'plotline-status' });
       }
@@ -1619,26 +1837,34 @@ async function checkStatusAlert() {
 /* ======== ADD / EDIT EVENT MODAL ======== */
 
 async function logNow(topic) {
-  const now = Date.now();
-  const id = await CWDB.nextId('events');
-  const m = state.measurements.find((m) => m.id === topic.msureid);
-  const defaultQant = (m && m.type === 3) ? 60 : 0;
-  const ev = { id, cost: 0, qant: defaultQant, time: now, topicid: topic.id, note: '' };
-  await CWDB.put('events', ev);
-  state.events.push(ev);
-  snack(`Logged ${topic.name}`, {
-    undo: async () => {
-      await CWDB.delete('events', id);
-      state.events = state.events.filter((e) => e.id !== id);
-      snack('Undone');
-      queueAutoSync('undoLog');
-      renderCurrent();
-    },
+  const kind = topicKind(topic);
+  const qant = kind === 'timeonly' ? 60 : topicPrefs(topic).quickAmount;
+  const time = Date.now();
+  if (kind !== 'timeonly' && qant == null) {
+    openAddEvent(topic);
+    return;
+  }
+  await CWMODEL.mutate(async () => {
+    const current = state.topics.find((item) => item.id === topic.id && !item.archived);
+    if (!current) {
+      throw new Error('This topic is no longer available.');
+    }
+    if (current.msureid !== topic.msureid || topicKind(current) !== kind) {
+      throw new Error('This topic changed while logging was queued. Please try again.');
+    }
+    const event = await CWDB.create('events', {
+      cost: 0, qant, time, topicid: topic.id, note: '',
+    });
+    snack(`Logged ${topic.name}${topicKind(topic) === 'timeonly' ? '' : ': ' + fmtQant(qant, topic)}`, {
+      undo: () => CWMODEL.mutate(() => CWDB.delete('events', event.id)),
+    });
   });
-  queueAutoSync('logNow');
-  if (state.view === 'categories') renderCategories();
-  if (state.view === 'recent') renderRecent();
-  if (state.view === 'day') renderDay();
+}
+
+function quickLabel(topic) {
+  if (topicKind(topic) === 'timeonly') return `+ ${topic.name}`;
+  const amount = topicPrefs(topic).quickAmount;
+  return amount == null ? `${topic.name}…` : `+ ${fmtQant(amount, topic)} ${topic.name}`;
 }
 
 function openAddEvent(topic, existing = null) {
@@ -1648,8 +1874,9 @@ function openAddEvent(topic, existing = null) {
   const isAmount = kind === 'amount';
   const isTimeOnly = kind === 'timeonly';
   const initTime = existing ? existing.time : Date.now();
-  const initQantSec = existing ? Number(existing.qant || 0) : (isDuration ? 60 : 0);
-  const initQantUnit = existing ? Number(existing.qant || 0) : 0;
+  const defaultAmount = topicPrefs(topic).quickAmount;
+  const initQantSec = existing ? Number(existing.qant || 0) : (defaultAmount ?? 0);
+  const initQantUnit = existing ? Number(existing.qant || 0) : (defaultAmount ?? '');
   const initSeverity = existing ? Number(existing.cost || 0) : 0;
 
   const qantHhmm = (() => {
@@ -1657,20 +1884,20 @@ function openAddEvent(topic, existing = null) {
     const s = initQantSec;
     const h = Math.floor(s / 3600);
     const mn = Math.floor((s % 3600) / 60);
-    return `${pad(h)}:${pad(mn)}`;
+    return `${pad(h)}:${pad(mn)}${s % 60 ? ':' + pad(s % 60) : ''}`;
   })();
 
   let qantField = '';
   if (isDuration) {
     qantField = `
       <div class="field">
-        <label>Duration (hh:mm)</label>
+        <label>Duration (hh:mm or hh:mm:ss)</label>
         <input id="qHhmm" type="text" inputmode="numeric" pattern="[0-9:]*" value="${qantHhmm}" placeholder="00:00">
-      </div>`;
+      </div>${existing ? '' : `<button type="button" class="btn secondary" id="startTimer">${state.activeTimers[topic.id] ? 'Stop & save running timer' : 'Start a timer instead'}</button>`}`;
   } else if (isAmount) {
     qantField = `
       <div class="field">
-        <label>Amount${m?.symbol ? ` (${m.symbol})` : ''}</label>
+        <label>Amount${m?.symbol ? ` (${escapeHtml(m.symbol)})` : ''}</label>
         <input id="qNum" type="number" step="any" value="${initQantUnit}">
       </div>`;
   }
@@ -1689,7 +1916,7 @@ function openAddEvent(topic, existing = null) {
       <button class="icon-btn" id="dialogSave" title="Save">✓</button>
     </header>
     <div class="body">
-      <div class="topic-name">${topicEmoji(topic) ? topicEmoji(topic) + ' ' : ''}${escapeHtml(topic.name)}</div>
+      <div class="topic-name">${escapeHtml(topicEmoji(topic))} ${escapeHtml(topic.name)}</div>
       ${qantField}
       <div class="row-2">
         <div class="field">
@@ -1725,6 +1952,11 @@ function openAddEvent(topic, existing = null) {
       ${existing ? `<button class="btn danger" id="dialogDelete" style="margin-top:8px;">Delete event</button>` : ''}
     </div>
   `);
+  bindAction($('#startTimer'), async ({ origin }) => {
+    if (state.activeTimers[topic.id]) await stopTimer(topic);
+    else await startTimer(topic);
+    closeModal({ origin });
+  });
 
   // Severity slider live update
   const sevInput = $('#evSev');
@@ -1765,84 +1997,93 @@ function openAddEvent(topic, existing = null) {
     if (re.test(ta.value)) btn.classList.add('active');
   });
 
-  $('#dialogSave').addEventListener('click', async () => {
+  bindAction($('#dialogSave'), async ({ form, origin }) => {
+    const $ = (selector) => form.querySelector(selector);
     const dateStr = $('#evDate').value;
     const timeStr = $('#evTime').value;
     if (!dateStr || !timeStr) { snack('Date and time are required'); return; }
     let qant = 0;
     if (isDuration) {
-      const raw = ($('#qHhmm').value || '0:0').trim();
-      const [h, mn] = raw.split(':').map((x) => Number(x || 0));
-      if (Number.isNaN(h) || Number.isNaN(mn)) { snack('Bad duration'); return; }
-      qant = h * 3600 + mn * 60;
-      if (qant === 0) qant = 60;
+      const raw = $('#qHhmm').value.trim();
+      if (!/^\d+:[0-5]\d(?::[0-5]\d)?$/.test(raw)) throw new Error('Enter duration as hh:mm or hh:mm:ss.');
+      const [h, mn, seconds = 0] = raw.split(':').map(Number);
+      qant = h * 3600 + mn * 60 + seconds;
+      if (!Number.isFinite(qant)) throw new Error('Enter a finite duration.');
     } else if (isAmount) {
-      const raw = Number($('#qNum').value || 0);
-      if (Number.isNaN(raw)) { snack('Bad amount'); return; }
+      if (!$('#qNum').value.trim()) throw new Error('Enter an amount.');
+      const raw = Number($('#qNum').value);
+      if (!Number.isFinite(raw)) throw new Error('Enter a finite amount.');
       qant = raw;
     } else {
       qant = existing ? Number(existing.qant || 60) : 60;
     }
     const time = parseDateTimeInput(dateStr, timeStr);
+    if (!Number.isFinite(time)) throw new Error('Enter a valid date and time.');
     const note = $('#evNote').value.trim();
     const severity = Number($('#evSev').value || 0);
 
     if (existing) {
+      const current = await CWDB.get('events', existing.id);
+      if (JSON.stringify(current) !== JSON.stringify(existing)) {
+        throw new Error('This entry changed elsewhere. Close and reopen it before saving.');
+      }
       const prev = { ...existing };
       const updated = { ...existing, qant, cost: severity, time, note };
       await CWDB.put('events', updated);
       const idx = state.events.findIndex((e) => e.id === existing.id);
       if (idx >= 0) state.events[idx] = updated;
-      closeModal();
+      closeModal({ origin });
       snack('Event updated', {
-        undo: async () => {
+        undo: () => CWMODEL.mutate(async () => {
           await CWDB.put('events', prev);
           const j = state.events.findIndex((e) => e.id === prev.id);
           if (j >= 0) state.events[j] = prev;
           queueAutoSync('undoEdit');
           renderCurrent();
           snack('Undone');
-        },
+        }),
       });
     } else {
-      const id = await CWDB.nextId('events');
-      const ev = { id, cost: severity, qant, time, topicid: topic.id, note };
-      await CWDB.put('events', ev);
+      const ev = await CWDB.create('events', { cost: severity, qant, time, topicid: topic.id, note });
       state.events.push(ev);
-      closeModal();
+      closeModal({ origin });
       snack(`Logged ${topic.name}`, {
-        undo: async () => {
-          await CWDB.delete('events', id);
-          state.events = state.events.filter((e) => e.id !== id);
+        undo: () => CWMODEL.mutate(async () => {
+          await CWDB.delete('events', ev.id);
+          state.events = state.events.filter((e) => e.id !== ev.id);
           queueAutoSync('undoLog');
           renderCurrent();
           snack('Undone');
-        },
+        }),
       });
     }
     queueAutoSync('saveEvent');
     renderCurrent();
-  });
+  }, { mutation: true });
 
   if (existing) {
     $('#dialogDelete').addEventListener('click', () => {
-      openConfirm('Delete this event?', 'This cannot be undone via the snackbar — only via re-add.', async () => {
+      openConfirm('Delete this event?', 'You can undo this deletion using the Undo message.', ({ origin }) => CWMODEL.mutate(async () => {
+        const current = await CWDB.get('events', existing.id);
+        if (JSON.stringify(current) !== JSON.stringify(existing)) {
+          throw new Error('This entry changed elsewhere. Close and reopen it before deleting.');
+        }
         const removed = { ...existing };
         await CWDB.delete('events', existing.id);
         state.events = state.events.filter((e) => e.id !== existing.id);
-        closeModal();
+        closeModal({ origin });
         snack('Event deleted', {
-          undo: async () => {
+          undo: () => CWMODEL.mutate(async () => {
             await CWDB.put('events', removed);
             state.events.push(removed);
             queueAutoSync('undoDelete');
             renderCurrent();
             snack('Undone');
-          },
+          }),
         });
         queueAutoSync('deleteEvent');
         renderCurrent();
-      });
+      }));
     });
   }
 }
@@ -1865,6 +2106,11 @@ const AMOUNT_UNITS = [
 
 function openTopicEdit(existing) {
   const existingKind = existing ? topicKind(existing) : 'timeonly';
+  const prefs = existing ? topicPrefs(existing) : {};
+  const hasHistory = !!existing && ((state.eventsByTopic.get(existing.id) || []).length > 0
+    || !!state.activeTimers[existing.id]);
+  const firstTime = existing ? (state.eventsByTopic.get(existing.id) || [])
+    .reduce((earliest, event) => Math.min(earliest, event.time), Date.now()) : Date.now();
   const initialUnit = existing && existingKind === 'amount'
     ? existing.msureid
     : 101;
@@ -1910,8 +2156,31 @@ function openTopicEdit(existing) {
       <div class="field" id="unitField" style="display:${existingKind==='amount'?'block':'none'};">
         <label>Unit</label>
         <select id="topicUnit">
+          ${existing && existingKind === 'amount' && !AMOUNT_UNITS.some((unit) => unit.id === initialUnit)
+            ? `<option value="${initialUnit}" selected>${escapeHtml(topicMeasurement(existing)?.name || 'Imported unit')} (keep existing)</option>` : ''}
           ${AMOUNT_UNITS.map((u) => `<option value="${u.id}" ${u.id===initialUnit?'selected':''}>${escapeHtml(u.label)}</option>`).join('')}
         </select>
+      </div>
+      ${hasHistory ? '<p class="muted-small">Type and unit are locked because this topic has entries or a running timer. Create a new topic for a different unit so old values keep their meaning.</p>' : ''}
+      <div class="tracking-settings">
+        <div class="field" id="quickAmountField" ${existingKind === 'timeonly' ? 'hidden' : ''}>
+          <label for="quickAmount">Quick-log default <span id="quickUnitHint">${existingKind === 'duration' ? '(minutes)' : '(topic units)'}</span></label>
+          <input id="quickAmount" type="number" step="any" value="${prefs.quickAmount == null ? '' : prefs.quickAmount / (existingKind === 'duration' ? 60 : 1)}" placeholder="Ask each time">
+          <p class="hint">Leave blank to enter a value each time.</p>
+        </div>
+        <div class="field" id="aggregationField" ${existingKind !== 'amount' ? 'hidden' : ''}>
+          <label for="topicAggregation">Measured value over a day</label>
+          <select id="topicAggregation">
+            <option value="sum" ${(prefs.aggregation || 'sum') === 'sum' ? 'selected' : ''}>Total (water, distance, counts)</option>
+            <option value="mean" ${prefs.aggregation === 'mean' ? 'selected' : ''}>Average (repeated observations)</option>
+            <option value="latest" ${prefs.aggregation === 'latest' ? 'selected' : ''}>Latest (weight, a single reading)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="trackingStart">Started tracking on</label>
+          <input id="trackingStart" type="date" max="${fmtDateInput(Date.now())}" value="${fmtDateInput(prefs.trackingStart ?? logicalDay(firstTime))}">
+          <p class="hint">Earlier dates are not assumed to be zero-event days.</p>
+        </div>
       </div>
       ${existing ? `
         <div class="field">
@@ -1924,7 +2193,7 @@ function openTopicEdit(existing) {
         </div>
         <div class="field">
           <label>
-            <input type="checkbox" id="topicArchived" ${existing.archived?'checked':''}> Archived (hides from Categories without deleting events)
+            <input type="checkbox" id="topicArchived" ${existing.archived?'checked':''}> Archived (hides from Topics without deleting events)
           </label>
         </div>
         <hr style="border:0;border-top:1px solid var(--rule);margin:24px 0 16px;">
@@ -1933,6 +2202,10 @@ function openTopicEdit(existing) {
       ` : ''}
     </div>
   `);
+  if (hasHistory) {
+    $$('input[name="kind"]').forEach((input) => { input.disabled = true; });
+    $('#topicUnit').disabled = true;
+  }
 
   let selectedColor = initColor;
   $$('#colorSwatches .swatch').forEach((sw) => {
@@ -1947,27 +2220,51 @@ function openTopicEdit(existing) {
     r.addEventListener('change', () => {
       const k = r.value;
       $('#unitField').style.display = (k === 'amount') ? 'block' : 'none';
+      $('#quickAmountField').hidden = k === 'timeonly';
+      $('#aggregationField').hidden = k !== 'amount';
+      $('#quickUnitHint').textContent = k === 'duration' ? '(minutes)' : '(topic units)';
+      $('#quickAmount').value = '';
     });
   });
 
-  $('#topicSave').addEventListener('click', async () => {
+  bindAction($('#topicSave'), async ({ form, origin }) => {
+    const $ = (selector) => form.querySelector(selector);
     const name = $('#topicName').value.trim();
     if (!name) { snack('Name required'); return; }
     const desc = $('#topicDesc').value.trim();
     const emoji = $('#topicEmoji').value.trim();
-    const kindEl = document.querySelector('input[name="kind"]:checked');
+    const kindEl = $('input[name="kind"]:checked');
     const kind = kindEl ? kindEl.value : 'timeonly';
     let msureid;
     if (kind === 'amount') {
       msureid = Number($('#topicUnit').value);
-    } else if (kind === 'duration') {
-      msureid = (existing && [10,11,12].includes(existing.msureid)) ? existing.msureid : 10;
     } else {
-      msureid = (existing && [10,11,12].includes(existing.msureid)) ? existing.msureid : 10;
+      msureid = existing && kind === existingKind ? existing.msureid : 10;
+    }
+    if (existing && ((state.eventsByTopic.get(existing.id) || []).length || state.activeTimers[existing.id])
+      && (kind !== existingKind || msureid !== existing.msureid)) {
+      throw new Error('Create a new topic to change the type or unit of existing history.');
+    }
+    const quickRaw = $('#quickAmount').value.trim();
+    const quickAmount = quickRaw === '' || kind === 'timeonly' ? null
+      : Number(quickRaw) * (kind === 'duration' ? 60 : 1);
+    if (quickAmount != null && (!Number.isFinite(quickAmount) || (kind === 'duration' && quickAmount < 0))) {
+      throw new Error('Enter a valid quick-log amount.');
+    }
+    const trackingDate = $('#trackingStart').value;
+    const trackingStart = dayBounds(parseDateTimeInput(trackingDate, '00:00'))[0];
+    if (!trackingDate || !Number.isFinite(trackingStart) || trackingStart > Date.now()) {
+      throw new Error('Choose a valid tracking start date, no later than today.');
     }
 
     let savedTopicId;
     if (existing) {
+      const current = await CWDB.get('topics', existing.id);
+      if (JSON.stringify(current) !== JSON.stringify(existing)
+        || JSON.stringify(state.topicPrefs[existing.id] || {}) !== JSON.stringify(prefs)
+        || JSON.stringify(state.topicMeta[existing.id] || {}) !== JSON.stringify(meta)) {
+        throw new Error('This topic changed elsewhere. Close and reopen the editor.');
+      }
       const updated = {
         ...existing,
         name, desc, msureid,
@@ -1977,22 +2274,26 @@ function openTopicEdit(existing) {
       await CWDB.setTopicKind(existing.id, kind);
       savedTopicId = existing.id;
     } else {
-      const id = await CWDB.nextId('topics');
-      const t = { id, name, desc, msureid, optype: 1, type: 1, archived: false };
-      await CWDB.put('topics', t);
+      const t = await CWDB.create('topics', { name, desc, msureid, optype: 1, type: 1, archived: false });
+      const id = t.id;
       const order = (await CWDB.getMeta('topicOrder')) || [];
       order.push(id);
       await CWDB.setMeta('topicOrder', order);
       await CWDB.setTopicKind(id, kind);
       savedTopicId = id;
     }
-    await CWDB.setTopicMeta(savedTopicId, { emoji, color: selectedColor });
-    closeModal();
+    await CWDB.setTopicMeta(savedTopicId, { emoji, color: $('#colorSwatches .swatch.on')?.dataset.color || initColor });
+    const allPrefs = await CWDB.getMeta('topicPrefs', {});
+    allPrefs[savedTopicId] = { ...prefs, aggregation: $('#topicAggregation').value, trackingStart };
+    if (quickAmount != null) allPrefs[savedTopicId].quickAmount = quickAmount;
+    else delete allPrefs[savedTopicId].quickAmount;
+    await CWDB.setMeta('topicPrefs', allPrefs);
+    closeModal({ origin });
     await reload();
     snack('Saved');
     queueAutoSync('saveTopic');
     renderCurrent();
-  });
+  }, { mutation: true });
 
   if (existing) {
     $('#topicGoalBtn').addEventListener('click', () => {
@@ -2004,22 +2305,15 @@ function openTopicEdit(existing) {
       openConfirm(
         `Delete "${existing.name}"?`,
         `This will permanently delete the topic AND all ${evCount.toLocaleString()} of its event${evCount === 1 ? '' : 's'}. This cannot be undone. Consider Archive instead if you just want to hide it.`,
-        async () => {
-          const evs = state.events.filter((e) => e.topicid === existing.id);
-          for (const e of evs) await CWDB.delete('events', e.id);
-          await CWDB.delete('topics', existing.id);
-          await CWDB.setTopicKind(existing.id, null);
-          await CWDB.setTopicMeta(existing.id, null);
-          await CWDB.setTopicGoal(existing.id, null);
-          await CWDB.setFavorite(existing.id, false);
-          const order = (await CWDB.getMeta('topicOrder')) || [];
-          await CWDB.setMeta('topicOrder', order.filter((x) => x !== existing.id));
-          closeModal();
+        ({ origin }) => CWMODEL.mutate(async () => {
+          const count = (state.eventsByTopic.get(existing.id) || []).length;
+          await CWDB.deleteTopic(existing.id);
+          closeModal({ origin });
           await reload();
-          snack(`Deleted "${existing.name}" and ${evCount.toLocaleString()} event${evCount === 1 ? '' : 's'}`);
+          snack(`Deleted "${existing.name}" and ${count.toLocaleString()} event${count === 1 ? '' : 's'}`);
           queueAutoSync('deleteTopic');
           renderCurrent();
-        },
+        }),
         'Delete forever'
       );
     });
@@ -2071,16 +2365,16 @@ function openTopicsManager() {
       closeModal();
       openTopicEdit(t);
     }));
-    $$('[data-up]').forEach((b) => b.addEventListener('click', async (e) => {
+    $$('[data-up]').forEach((b) => bindAction(b, async (e) => {
       const id = Number(e.currentTarget.dataset.up);
       await moveTopic(id, -1);
-      openTopicsManager(); // re-render
-    }));
-    $$('[data-down]').forEach((b) => b.addEventListener('click', async (e) => {
+      if ($('#modalRoot .dialog') === e.origin) openTopicsManager();
+    }, { mutation: true }));
+    $$('[data-down]').forEach((b) => bindAction(b, async (e) => {
       const id = Number(e.currentTarget.dataset.down);
       await moveTopic(id, +1);
-      openTopicsManager();
-    }));
+      if ($('#modalRoot .dialog') === e.origin) openTopicsManager();
+    }, { mutation: true }));
   };
   wire();
 }
@@ -2149,7 +2443,7 @@ function openQuickBarManager() {
       <div class="title">Quick-access bar</div>
     </header>
     <div class="body" style="padding:0;">
-      <div class="mgr-hint">These chips appear pinned at the top of Categories for one-tap logging. ▲▼ to reorder.</div>
+      <div class="mgr-hint">These chips appear at the top of Topics. Measured values use your explicit quick-log default, or ask each time. ▲▼ to reorder.</div>
       <div class="sticky-header">Pinned</div>
       ${pinnedSection}
       <div class="sticky-header">Available topics</div>
@@ -2157,27 +2451,27 @@ function openQuickBarManager() {
     </div>
   `);
 
-  const reopen = () => openQuickBarManager();
-  $$('[data-qadd]').forEach((b) => b.addEventListener('click', async (e) => {
+  const reopen = (event) => { if ($('#modalRoot .dialog') === event.origin) openQuickBarManager(); };
+  $$('[data-qadd]').forEach((b) => bindAction(b, async (e) => {
     const id = Number(e.currentTarget.dataset.qadd);
     if (!pinnedSet.has(id)) await saveQuickBar([...pinnedIds, id]);
-    reopen();
-  }));
-  $$('[data-qremove]').forEach((b) => b.addEventListener('click', async (e) => {
+    reopen(e);
+  }, { mutation: true }));
+  $$('[data-qremove]').forEach((b) => bindAction(b, async (e) => {
     const id = Number(e.currentTarget.dataset.qremove);
     await saveQuickBar(pinnedIds.filter((x) => x !== id));
-    reopen();
-  }));
-  $$('[data-qup]').forEach((b) => b.addEventListener('click', async (e) => {
+    reopen(e);
+  }, { mutation: true }));
+  $$('[data-qup]').forEach((b) => bindAction(b, async (e) => {
     const id = Number(e.currentTarget.dataset.qup);
     await saveQuickBar(swap(pinnedIds, id, -1));
-    reopen();
-  }));
-  $$('[data-qdown]').forEach((b) => b.addEventListener('click', async (e) => {
+    reopen(e);
+  }, { mutation: true }));
+  $$('[data-qdown]').forEach((b) => bindAction(b, async (e) => {
     const id = Number(e.currentTarget.dataset.qdown);
     await saveQuickBar(swap(pinnedIds, id, +1));
-    reopen();
-  }));
+    reopen(e);
+  }, { mutation: true }));
 }
 
 function swap(arr, id, delta) {
@@ -2221,7 +2515,7 @@ function triggerImport() {
       openModal(`
         <header><button class="icon-btn" data-close>←</button><div class="title">Import preview</div></header>
         <div class="body">
-          <p><strong>${file.name}</strong></p>
+          <p><strong>${escapeHtml(file.name)}</strong></p>
           <ul>
             <li>Version: ${escapeHtml(String(sum.version))}</li>
             <li>Topics: ${sum.topics.toLocaleString()}</li>
@@ -2241,23 +2535,23 @@ function triggerImport() {
           <button class="btn" id="impReplace">Replace</button>
         </div>
       `);
-      $('#impMerge').addEventListener('click', async () => {
+      bindAction($('#impMerge'), async ({ origin }) => {
         await CWIO.importMerge(obj);
-        closeModal();
+        closeModal({ origin });
         await reload();
         snack(`Merged ${sum.events.toLocaleString()} events`);
         queueAutoSync('import');
         renderCurrent();
-      });
-      $('#impReplace').addEventListener('click', async () => {
+      }, { mutation: true });
+      bindAction($('#impReplace'), async ({ origin }) => {
         await CWIO.safetyBackup();
         await CWIO.importReplace(obj);
-        closeModal();
+        closeModal({ origin });
         await reload();
         snack(`Loaded ${sum.events.toLocaleString()} events`);
         queueAutoSync('import');
         renderCurrent();
-      });
+      }, { mutation: true });
     } catch (err) {
       snack('Import failed: ' + err.message);
     }
@@ -2267,6 +2561,7 @@ function triggerImport() {
 
 async function doExport() {
   await CWIO.exportToFile('plotline-backup.json');
+  await reload(); renderCurrent();
   snack('Exported plotline-backup.json');
 }
 
@@ -2286,7 +2581,52 @@ async function doSafetyBackup() {
 /* ======== MENU ACTIONS ======== */
 
 function openDrive() {
-  CWDRIVE.openSetupDialog({ openModal, closeModal, snack, reload, renderCurrent });
+  CWDRIVE.openSetupDialog({ openModal, closeModal, snack, reload, renderCurrent, openConfirm });
+}
+
+function openReportDialog() {
+  const today = logicalDay();
+  openModal(`
+    <header><button class="icon-btn" data-close>←</button><div class="title">Export summary</div></header>
+    <div class="body">
+      <p>A readable HTML summary with values, notes, and associations. Open the downloaded file offline or print it to PDF.</p>
+      <div class="row-2"><div class="field"><label for="reportFrom">From</label><input type="date" id="reportFrom" value="${fmtDateInput(CWINSIGHTS.addDays(today, -29))}"></div>
+      <div class="field"><label for="reportTo">Through</label><input type="date" id="reportTo" value="${fmtDateInput(today)}"></div></div>
+      <div class="field"><label for="reportTopic">Topic</label><select id="reportTopic"><option value="">All topics</option>
+        ${state.topics.map((topic) => `<option value="${topic.id}">${escapeHtml(topic.name)}</option>`).join('')}</select></div>
+      <p class="muted-small">Includes personal notes. Review the file before sharing. This is not a restorable backup.</p>
+    </div>
+    <div class="actions"><button class="btn secondary" data-close>Cancel</button><button class="btn" id="reportSave">Download summary</button></div>`);
+  bindAction($('#reportSave'), async () => {
+    const fromDate = $('#reportFrom').value;
+    const toDate = $('#reportTo').value;
+    if (!fromDate || !toDate || fromDate > toDate || toDate > fmtDateInput(logicalDay())) {
+      throw new Error('Choose a valid date range ending no later than today.');
+    }
+    const from = dayBounds(new Date(fromDate + 'T00:00:00').getTime())[0];
+    const to = dayBounds(new Date(toDate + 'T00:00:00').getTime())[1];
+    const topicId = Number($('#reportTopic').value) || null;
+    const topics = state.topics.filter((topic) => topicId == null || topic.id === topicId);
+    const allowed = new Set(topics.map((topic) => topic.id));
+    const events = state.events.filter((event) => allowed.has(event.topicid) && event.time >= from && event.time < to);
+    let days = 0;
+    for (let key = logicalDay(from); key < logicalDay(to); key = CWINSIGHTS.addDays(key, 1)) days++;
+    const settings = insightsSettings();
+    const analysis = CWINSIGHTS.analyze({
+      events, topics, roles: state.topicRoles, kinds: state.topicKinds,
+      topicPrefs: state.topicPrefs, dayChecks: state.dayChecks, measurements: measurementsByTopic(),
+      cutoffHour: settings.cutoffHour, nightStart: settings.nightStart, nightEnd: settings.nightEnd,
+      insightWindow: Math.min(400, days), now: Math.min(to - 1, Date.now()),
+    });
+    const findings = (analysis.narrative || []).filter((finding) => finding.test).slice(0, 10)
+      .map((finding) => ({ text: `${finding.text} Based on ${finding.test.n} paired days; q=${finding.test.q.toFixed(3)}.`
+        + (days > 400 ? ' Analysis is limited to the final 400 days of this range.' : '') }));
+    const html = CWREPORT.build({ topics, events, measurements: state.measurements,
+      kinds: state.topicKinds, prefs: state.topicPrefs, from, to, findings, cutoffHour: settings.cutoffHour });
+    CWREPORT.download(html, `plotline-summary-${fromDate}-${toDate}.html`);
+    closeModal();
+    snack('Summary downloaded');
+  });
 }
 
 function openAbout() {
@@ -2339,26 +2679,21 @@ async function openStorageStatus() {
 
 function openWipe() {
   openConfirm(
-    'Wipe all local data?',
-    `This deletes all ${state.events.length.toLocaleString()} events and ${state.topics.length} topics from this device. A safety backup will be downloaded first.`,
+    'Reset this device?',
+    `This removes ${state.events.length.toLocaleString()} events and ${state.topics.length} topics from this device only. Drive will be disconnected and your Drive backup will NOT be changed. A safety backup downloads first.`,
     async () => {
-      await CWIO.safetyBackup();
-      await CWDB.clearAll();
-      await CWDB.seedDefaults();
-      closeModal();
-      await reload();
-      // A wipe must overwrite Drive rather than merge, otherwise the next
-      // sync would helpfully restore everything we just deleted.
-      let msg = 'All data wiped';
-      try {
-        await window.CWDRIVE?.syncNow?.({ interactive: false, force: true });
-      } catch (e) {
-        if (e && e.message !== 'NO_CLIENT_ID') msg += ' (Drive copy unchanged)';
-      }
-      snack(msg);
-      renderCurrent();
+      await CWDRIVE.disconnect();
+      await CWMODEL.mutate(async () => {
+        await CWIO.safetyBackup();
+        await CWDB.clearAll({ keepDeviceMeta: false });
+        await CWDB.setMeta('driveEnabled', false);
+        await CWDB.seedDefaults();
+        closeModal();
+      });
+      snack('Device reset. Your Drive backup is unchanged.');
+      openOnboarding();
     },
-    'Wipe everything'
+    'Reset this device'
   );
 }
 
@@ -2369,78 +2704,31 @@ function setView(view) {
   state.view = view;
   $$('.app-tabs .tab').forEach((t) => {
     t.setAttribute('aria-selected', t.dataset.view === view);
+    t.tabIndex = t.dataset.view === view ? 0 : -1;
+    t.id = `tab-${t.dataset.view}`;
+    t.setAttribute('aria-controls', 'main');
   });
+  $('#main').setAttribute('aria-labelledby', `tab-${view}`);
   renderCurrent();
 }
 
 function renderCurrent() {
+  const active = document.activeElement;
+  const hadFocus = $('#main').contains(active) && active !== $('#main');
+  let focusSelector = active?.id && /^[A-Za-z][\w-]*$/.test(active.id) ? `#${active.id}` : null;
+  if (!focusSelector && active?.dataset) {
+    for (const key of ['add', 'quick', 'event', 'goal']) {
+      if (active.dataset[key]) { focusSelector = `[data-${key}="${active.dataset[key]}"]`; break; }
+    }
+  }
+  destroyCharts();
   if (state.view === 'categories') renderCategories();
   else if (state.view === 'recent') renderRecent();
   else if (state.view === 'day') renderDay();
   else if (state.view === 'stats') renderStats();
   else if (state.view === 'insights') renderInsights();
-}
-
-/* ======== MODAL / SNACKBAR / DRAWER ======== */
-
-function openModal(html, { dismissible = true } = {}) {
-  const root = $('#modalRoot');
-  root.innerHTML = `<div class="scrim"><section class="dialog">${html}</section></div>`;
-  root.querySelectorAll('[data-close]').forEach((el) => {
-    el.addEventListener('click', () => closeModal());
-  });
-  if (dismissible) {
-    root.querySelector('.scrim').addEventListener('click', (e) => {
-      if (e.target === e.currentTarget) closeModal();
-    });
-  }
-  pushOverlayState('modal');
-}
-
-function closeModal({ fromHistory = false } = {}) {
-  $('#modalRoot').innerHTML = '';
-  if (!fromHistory) popOverlayState('modal');
-}
-
-function openConfirm(title, body, onYes, yesLabel = 'Yes') {
-  openModal(`
-    <header><button class="icon-btn" data-close>←</button><div class="title">${escapeHtml(title)}</div></header>
-    <div class="body confirm"><p>${escapeHtml(body)}</p></div>
-    <div class="actions">
-      <button class="btn secondary" data-close>Cancel</button>
-      <button class="btn danger" id="confirmYes">${escapeHtml(yesLabel)}</button>
-    </div>
-  `);
-  $('#confirmYes').addEventListener('click', onYes);
-}
-
-let snackTimer = null;
-let snackUndoCallback = null;
-function snack(msg, opts = {}) {
-  const sb = $('#snackbar');
-  const onUndo = opts.undo || null;
-  snackUndoCallback = onUndo;
-  if (onUndo) {
-    sb.innerHTML = `<span class="snack-msg">${escapeHtml(msg)}</span>
-      <button class="snack-action" id="snackUndoBtn">UNDO</button>`;
-    sb.querySelector('#snackUndoBtn').addEventListener('click', async () => {
-      if (snackUndoCallback) {
-        const cb = snackUndoCallback;
-        snackUndoCallback = null;
-        sb.classList.remove('show');
-        try { await cb(); } catch (e) { console.error(e); }
-      }
-    });
-  } else {
-    sb.textContent = msg;
-  }
-  sb.classList.add('show');
-  if (snackTimer) clearTimeout(snackTimer);
-  const duration = onUndo ? 5000 : 2200;
-  snackTimer = setTimeout(() => {
-    sb.classList.remove('show');
-    snackUndoCallback = null;
-  }, duration);
+  CWUI.labelControls($('#main'));
+  if (hadFocus && !$('#modalRoot .dialog')) ($(focusSelector || '#main') || $('#main')).focus({ preventScroll: true });
 }
 
 /* ======== TOPIC META (emoji + color) ======== */
@@ -2490,76 +2778,11 @@ function severityBadge(ev) {
   return `<span class="sev-badge ${cls}" title="Severity ${s}/5">●${s}</span>`;
 }
 
-function openDrawer() {
-  $('#drawer').classList.add('open');
-  pushOverlayState('drawer');
-}
-function closeDrawer({ fromHistory = false } = {}) {
-  $('#drawer').classList.remove('open');
-  if (!fromHistory) popOverlayState('drawer');
-}
-
-/* ======== HISTORY-BACKED OVERLAY STACK ========
- * Pushes a state entry when any overlay (modal, drawer) opens so the
- * Android system back gesture closes the overlay instead of exiting
- * the PWA. The stack mirrors what's actually open in the DOM so we
- * don't pop too many history entries.
- *
- * _expectingPop tracks history.back() calls we initiated ourselves
- * (e.g., closing a drawer then immediately opening a modal). When the
- * resulting popstate arrives we decrement and ignore it, so we never
- * mistakenly close the new overlay.
- */
-const _overlayStack = [];
-let _expectingPop = 0;
-
-function pushOverlayState(kind) {
-  _overlayStack.push(kind);
-  try {
-    history.pushState({ cw_overlay: kind, n: _overlayStack.length }, '');
-  } catch (_) { /* private mode etc. */ }
-}
-
-function popOverlayState(kind) {
-  // Only pop history if the topmost entry matches this overlay.
-  const top = _overlayStack[_overlayStack.length - 1];
-  if (top !== kind) return;
-  _overlayStack.pop();
-  if (history.state?.cw_overlay) {
-    _expectingPop++;
-    try { history.back(); } catch (_) { _expectingPop--; }
-  }
-}
-
-function handlePopState() {
-  if (_expectingPop > 0) {
-    _expectingPop--;
-    return; // self-initiated, ignore
-  }
-  // User-initiated back gesture: close whatever overlay is on top.
-  const top = _overlayStack.pop();
-  if (top === 'modal') {
-    closeModal({ fromHistory: true });
-  } else if (top === 'drawer') {
-    closeDrawer({ fromHistory: true });
-  }
-}
-
-function escapeHtml(s) {
-  if (s == null) return '';
-  return String(s)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-
 /* ======== AUTO-SYNC (calls into drive.js if configured) ======== */
 function queueAutoSync(reason = 'change') {
   state.insightsDirty = true;   // data changed -> recompute insights lazily
   if (window.CWDRIVE?.queueAutoSync) {
-    window.CWDRIVE.queueAutoSync(reason);
+    window.CWDRIVE.queueAutoSync(reason).catch(reportError);
   }
 }
 
@@ -2574,8 +2797,12 @@ function openTopicPicker() {
     return;
   }
   const topics = state.topics.filter((t) => !t.archived);
+  if (!topics.length) {
+    openConfirm('No active topics', 'Unarchive a topic or add a new one to log an entry.', openTopicsManager, 'Manage topics');
+    return;
+  }
   const rows = topics.map((t) => `
-    <div class="topic-row" data-topic="${t.id}" style="cursor:pointer;">
+    <div class="topic-row" data-topic="${t.id}" role="button" tabindex="0" style="cursor:pointer;">
       <div><div class="t-name">${escapeHtml(t.name)}</div></div>
       <div></div>
       <div></div>
@@ -2585,7 +2812,10 @@ function openTopicPicker() {
     <header><button class="icon-btn" data-close>←</button><div class="title">Pick topic</div></header>
     <div class="body" style="padding:0;">${rows}</div>
   `);
-  $$('[data-topic]').forEach((row) => {
+  $$('[data-topic]', $('#modalRoot')).forEach((row) => {
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); row.click(); }
+    });
     row.addEventListener('click', () => {
       const id = Number(row.dataset.topic);
       const t = state.topics.find((x) => x.id === id);
@@ -2670,15 +2900,18 @@ async function applyPreset(preset) {
   const order = (await CWDB.getMeta('topicOrder')) || [];
   const roles = (await CWDB.getTopicRoles()) || {};
   const goals = (await CWDB.getTopicGoals()) || {};
+  const prefs = (await CWDB.getMeta('topicPrefs')) || {};
   for (const spec of preset.topics) {
-    const id = await CWDB.nextId('topics');
-    await CWDB.put('topics', {
-      id, name: spec.name, desc: '', msureid: presetMeasurementId(spec),
+    const topic = await CWDB.create('topics', {
+      name: spec.name, desc: '', msureid: presetMeasurementId(spec),
       optype: 1, type: 1, archived: false,
     });
+    const id = topic.id;
     order.push(id);
     await CWDB.setTopicKind(id, spec.kind);
     await CWDB.setTopicMeta(id, { emoji: spec.emoji, color: spec.color });
+    prefs[id] = { aggregation: spec.name === 'Weight' ? 'latest' : 'sum', trackingStart: Date.now() };
+    if (spec.name === 'Water') prefs[id].quickAmount = 8;
     if (spec.role) {
       roles[id] = { role: spec.role, dir: spec.dir || 'down', timing: !!spec.timing };
     }
@@ -2693,6 +2926,7 @@ async function applyPreset(preset) {
   await CWDB.setMeta('topicOrder', order);
   await CWDB.setTopicRoles(roles);
   await CWDB.setTopicGoals(goals);
+  await CWDB.setMeta('topicPrefs', prefs);
   await CWDB.setMeta('onboarded', true);
 }
 
@@ -2721,29 +2955,59 @@ function openOnboarding() {
     <header><div class="title">What do you want to track?</div></header>
     <div class="body">
       <p class="muted-small">Pick a starting point. These are just topics — rename,
-      delete or add to them any time. Already have a backup? Choose Custom, then
-      import it.</p>
+      delete or add to them any time. Already have data? Restore it below before
+      choosing a preset.</p>
       ${cards}
     </div>
     <div class="actions">
       <button class="btn secondary" id="onboardImport">Import a backup…</button>
+      <button class="btn secondary" id="onboardDrive">Restore from Drive…</button>
     </div>
   `, { dismissible: false });
 
   $$('[data-preset]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
+    bindAction(btn, async () => {
       const preset = PRESETS.find((p) => p.id === btn.dataset.preset);
-      btn.disabled = true;
+      $$('[data-preset]').forEach((button) => { button.disabled = true; });
       await applyPreset(preset);
       closeModal();
       await reload();
+      renderCurrent();
       if (preset.topics.length) snack(`${preset.name} topics added`);
-    });
+    }, { mutation: true });
   });
-  $('#onboardImport').addEventListener('click', async () => {
-    await CWDB.setMeta('onboarded', true);
+  bindAction($('#onboardImport'), async () => {
     closeModal();
     triggerImport();
+  });
+  bindAction($('#onboardDrive'), async () => {
+    const existingTopics = await CWDB.getAll('topics');
+    const existingEvents = await CWDB.getAll('events');
+    if (existingTopics.length || existingEvents.length) throw new Error('This device now has data. Use Drive setup to confirm a restore.');
+    await CWDRIVE.syncDown({ interactive: true });
+    await CWDB.setMeta('onboarded', true);
+    closeModal();
+    await reload();
+    renderCurrent();
+    snack('Restored from Drive');
+  });
+}
+
+let waitingWorker = null;
+let updatingApp = false;
+
+function watchUpdates(registration) {
+  const announce = () => {
+    if (!registration.waiting) return;
+    waitingWorker = registration.waiting;
+    $('#updateNotice').hidden = false;
+  };
+  announce();
+  registration.addEventListener('updatefound', () => {
+    const installing = registration.installing;
+    installing?.addEventListener('statechange', () => {
+      if (installing.state === 'installed') announce();
+    });
   });
 }
 
@@ -2773,10 +3037,8 @@ async function init() {
 
   // Header buttons
   $('#menuBtn').addEventListener('click', openDrawer);
-  $('#exportBtn').addEventListener('click', doExport);
-  $('#addBtn').addEventListener('click', openTopicPicker);
   $('#fab').addEventListener('click', openTopicPicker);
-  $('#syncPill').addEventListener('click', async (e) => {
+  bindAction($('#syncPill'), async (e) => {
     e.stopPropagation();
     if (!window.CWDRIVE) return;
     try {
@@ -2796,29 +3058,67 @@ async function init() {
   $('#drawer').querySelectorAll('[data-close]').forEach((el) =>
     el.addEventListener('click', () => closeDrawer()));
   $('#navImport').addEventListener('click', () => { closeDrawer(); triggerImport(); });
-  $('#navExport').addEventListener('click', () => { closeDrawer(); doExport(); });
-  $('#navExportCsv').addEventListener('click', () => { closeDrawer(); doExportCsv(); });
-  $('#navBackup').addEventListener('click', () => { closeDrawer(); doSafetyBackup(); });
+  bindAction($('#navExport'), async () => { closeDrawer(); await doExport(); });
+  bindAction($('#navExportCsv'), async () => { closeDrawer(); await doExportCsv(); });
+  $('#navReport').addEventListener('click', () => { closeDrawer(); openReportDialog(); });
+  bindAction($('#navBackup'), async () => { closeDrawer(); await doSafetyBackup(); });
   $('#navTopics').addEventListener('click', () => { closeDrawer(); openTopicsManager(); });
   $('#navQuickBar').addEventListener('click', () => { closeDrawer(); openQuickBarManager(); });
   $('#navRoles').addEventListener('click', () => { closeDrawer(); openRolesSetup(); });
   $('#navAlerts').addEventListener('click', () => { closeDrawer(); openAlertsDialog(); });
   $('#navDrive').addEventListener('click', () => { closeDrawer(); openDrive(); });
   $('#navAbout').addEventListener('click', () => { closeDrawer(); openAbout(); });
-  $('#navStorage').addEventListener('click', () => { closeDrawer(); openStorageStatus(); });
+  bindAction($('#navStorage'), async () => { closeDrawer(); await openStorageStatus(); });
   $('#navWipe').addEventListener('click', () => { closeDrawer(); openWipe(); });
   const drawerVersionEl = $('#drawerVersion');
   if (drawerVersionEl) drawerVersionEl.textContent = window.CW_VERSION || '';
 
   // Back-gesture handler: close overlays instead of exiting the PWA
   window.addEventListener('popstate', handlePopState);
+  $('#tabs').addEventListener('keydown', (event) => {
+    const index = VIEWS.indexOf(state.view);
+    let target = null;
+    if (event.key === 'ArrowRight') target = (index + 1) % VIEWS.length;
+    if (event.key === 'ArrowLeft') target = (index + VIEWS.length - 1) % VIEWS.length;
+    if (event.key === 'Home') target = 0;
+    if (event.key === 'End') target = VIEWS.length - 1;
+    if (target == null) return;
+    event.preventDefault();
+    setView(VIEWS[target]);
+    $(`#tab-${VIEWS[target]}`).focus();
+  });
+  CWMODEL.start();
+  setInterval(() => { if (document.visibilityState !== 'hidden') refreshLiveLabels(); }, 30000);
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState !== 'visible') return;
+    try {
+      await reload();
+      if (!$('#modalRoot .dialog')) renderCurrent();
+      refreshLiveLabels();
+    } catch (error) { reportError(error); }
+  });
 
   // Listen for service worker update prompts
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('controllerchange', () => {
-      // a new SW took over; nothing to do
+      if (updatingApp) location.reload();
     });
   }
+  bindAction($('#installUpdate'), async () => {
+    if (!waitingWorker) throw new Error('The update is no longer waiting. Reopen the app to check again.');
+    if ($('#modalRoot .dialog')) throw new Error('Finish or close the editor before updating.');
+    await CWMODEL.prepareUpdate();
+    try {
+      if ($('#modalRoot .dialog')) throw new Error('Finish or close the editor before updating.');
+      updatingApp = true;
+      if (waitingWorker.state === 'activated') location.reload();
+      else waitingWorker.postMessage({ type: 'ACTIVATE_UPDATE' });
+    } catch (error) {
+      updatingApp = false;
+      CWMODEL.cancelUpdate();
+      throw error;
+    }
+  });
 
   setView('categories');
 
@@ -2831,7 +3131,7 @@ async function init() {
   try { await checkStatusAlert(); } catch (e) { console.warn(e); }
 }
 
-window.addEventListener('DOMContentLoaded', init);
+window.addEventListener('DOMContentLoaded', () => init().catch(reportError));
 // Exposed for inline onclick in empty states + drive.js callbacks
 window.openTopicEdit = openTopicEdit;
 window.CWAPP = {
@@ -2842,4 +3142,6 @@ window.CWAPP = {
   closeModal,
   $, $$,
   fmtDateLong, fmtTime,
+  mutate: CWMODEL.mutate,
+  watchUpdates,
 };

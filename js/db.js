@@ -96,9 +96,147 @@ const DEVICE_META_KEYS = [
   'driveClientId', 'driveSyncBase', 'driveRemoteMeta',
   'driveLegacyCleanupAt', 'driveLegacyCleanupDone',
   'lastDriveSync', 'lastLocalChangeAt', 'lastFlareAlert', 'onboarded',
+  'driveEnabled', 'deviceId', 'syncDeviceId', 'syncCounter',
+  'driveFolderId', 'drivePendingSnapshot', 'dataRevision',
 ];
 
+function randomId() {
+  if (!window.crypto?.getRandomValues) throw new Error('Secure random IDs require crypto.getRandomValues.');
+  const words = new Uint32Array(2);
+  let id;
+  do {
+    window.crypto.getRandomValues(words);
+    id = (words[0] & 0x1fffff) * 0x100000000 + words[1];
+  } while (!id);
+  return id;
+}
+
+function transactionDone(t, value) {
+  return new Promise((resolve, reject) => {
+    t.oncomplete = () => resolve(typeof value === 'function' ? value() : value);
+    t.onerror = () => reject(t.error || new Error('Database transaction failed.'));
+    t.onabort = () => reject(t.error || new Error('Database transaction aborted.'));
+  });
+}
+
+/* Sync supplies provenance from its merge, never IDs guessed from the new
+ * dataset. Check again inside replacement's transaction, before any clears. */
+function timersForReplacement(current, replacement, { topicIdMap, measurementIdMap } = {}) {
+  const row = current.meta.find((r) => r.key === 'activeTimers');
+  if (!row) return null;
+  const conflict = (detail) => {
+    throw new Error(`TIMER_CONFLICT: ${detail} Finish or cancel the local timer before syncing.`);
+  };
+  if (!row.value || typeof row.value !== 'object' || Array.isArray(row.value)) conflict('Invalid active timer metadata.');
+  const oldTopics = new Map(current.topics.map((r) => [r.id, r]));
+  const newTopics = new Map(replacement.topics.map((r) => [r.id, r]));
+  const oldUnits = new Map(current.measurements.map((r) => [r.id, r]));
+  const newUnits = new Map(replacement.measurements.map((r) => [r.id, r]));
+  const oldKinds = current.meta.find((r) => r.key === 'topicKinds')?.value || {};
+  const newKinds = replacement.meta.find((r) => r.key === 'topicKinds')?.value || {};
+  const mapped = (map, id) => map && Object.hasOwn(map, id) ? map[id] : undefined;
+  const timers = {};
+  for (const [key, start] of Object.entries(row.value)) {
+    const id = Number(key), nextId = mapped(topicIdMap, id);
+    const oldTopic = oldTopics.get(id), newTopic = newTopics.get(nextId);
+    if (!Number.isSafeInteger(id) || String(id) !== key ||
+        !Number.isSafeInteger(start) || Math.abs(start) > 8640000000000000) conflict('Invalid timer start or topic ID.');
+    if (!oldTopic || !Number.isSafeInteger(nextId) || !newTopic || Object.hasOwn(timers, nextId)) {
+      conflict(`The topic for timer ${key} was deleted or its identity is uncertain.`);
+    }
+    const oldUnit = oldUnits.get(oldTopic.msureid), newUnit = newUnits.get(newTopic.msureid);
+    const oldKind = oldKinds[id] || (oldUnit?.type === 3 ? 'duration' : 'amount');
+    const newKind = newKinds[nextId] || (newUnit?.type === 3 ? 'duration' : 'amount');
+    if (oldKind !== 'duration' || newKind !== 'duration' ||
+        oldUnit?.type !== 3 || newUnit?.type !== 3 ||
+        mapped(measurementIdMap, oldTopic.msureid) !== newTopic.msureid ||
+        oldUnit.format !== newUnit.format || oldTopic.type !== newTopic.type) {
+      conflict(`The type or unit of "${oldTopic.name}" changed incompatibly.`);
+    }
+    timers[nextId] = start;
+  }
+  return { ...row, value: timers };
+}
+
+/* The builder is synchronous: it receives a consistent snapshot under the
+ * write lock and returns ALL stores. No writes happen until preparation ends.
+ * Never await inside the builder. Any exception/failed add rolls back all stores. */
+async function datasetTransaction(builder, { keepDeviceMeta = true, readonly = false } = {}) {
+  const connection = await openDB();
+  return new Promise((resolve, reject) => {
+    const names = Object.keys(STORES);
+    const t = connection.transaction(names, readonly ? 'readonly' : 'readwrite');
+    const snapshot = {};
+    let pending = names.length, result, failure;
+    t.oncomplete = () => resolve(result);
+    t.onerror = () => { failure = failure || t.error; };
+    t.onabort = () => reject(failure || t.error || new Error('Dataset transaction aborted.'));
+    for (const name of names) {
+      const req = t.objectStore(name).getAll();
+      req.onsuccess = () => {
+        snapshot[name] = req.result;
+        if (--pending) return;
+        try {
+          if (readonly) { result = snapshot; return; }
+          const device = keepDeviceMeta ? snapshot.meta.filter((r) => DEVICE_META_KEYS.includes(r.key)) : [];
+          result = builder(snapshot);
+          if (!result || typeof result.then === 'function') throw new Error('Dataset builder must return synchronously.');
+          for (const key of names) {
+            if (!Array.isArray(result[key])) throw new Error(`Missing dataset store: ${key}`);
+          }
+          result.meta = result.meta.filter((r) => !DEVICE_META_KEYS.includes(r.key)).concat(device);
+          for (const key of names) {
+            const store = t.objectStore(key);
+            store.clear();
+            for (const record of result[key]) store.add(record);
+          }
+        } catch (error) {
+          failure = error;
+          t.abort();
+        }
+      };
+    }
+  });
+}
+
 const db = {
+  DEVICE_META_KEYS,
+  randomId,
+  getDataset() { return datasetTransaction(null, { readonly: true }); },
+  updateDataset: datasetTransaction,
+  replaceDataset(dataset, options = {}) {
+    return datasetTransaction((current) => {
+      const timer = options.preserveActiveTimers ? timersForReplacement(current, dataset, options) : null;
+      const replacement = { ...dataset, meta: dataset.meta.filter((r) => r.key !== 'activeTimers') };
+      if (timer) replacement.meta.push(timer);
+      return replacement;
+    }, options);
+  },
+  async checkTimerReplacement(dataset, options) {
+    timersForReplacement(await this.getDataset(), dataset, options);
+  },
+
+  /* Insert-only allocation. Unlike nextId + put, concurrent writers can
+   * never replace an existing record. Returns the committed record. */
+  async create(store, fields) {
+    if (STORES[store] !== 'id') throw new Error('create requires an id-keyed store.');
+    const { t, stores } = await tx(store, 'readwrite');
+    let record;
+    const done = transactionDone(t, () => record);
+    const attempt = () => {
+      record = { ...fields, id: randomId() };
+      const req = stores.add(record);
+      req.onerror = (event) => {
+        if (req.error?.name !== 'ConstraintError') return;
+        event.preventDefault();
+        event.stopPropagation();
+        attempt();
+      };
+    };
+    try { attempt(); } catch (error) { t.abort(); await done.catch(() => {}); throw error; }
+    return done;
+  },
+
   async getAll(store) {
     const { stores } = await tx(store);
     return reqToPromise(stores.getAll());
@@ -111,61 +249,166 @@ const db = {
 
   async put(store, value) {
     const { t, stores } = await tx(store, 'readwrite');
-    stores.put(value);
-    return new Promise((resolve, reject) => {
-      t.oncomplete = () => resolve(value);
-      t.onerror = () => reject(t.error);
-    });
+    const done = transactionDone(t, value);
+    try { stores.put(value); } catch (error) { t.abort(); await done.catch(() => {}); throw error; }
+    return done;
   },
 
   async putMany(store, values) {
     if (!values.length) return 0;
     const { t, stores } = await tx(store, 'readwrite');
-    for (const v of values) stores.put(v);
-    return new Promise((resolve, reject) => {
-      t.oncomplete = () => resolve(values.length);
-      t.onerror = () => reject(t.error);
-    });
+    const done = transactionDone(t, values.length);
+    try { for (const v of values) stores.put(v); } catch (error) { t.abort(); await done.catch(() => {}); throw error; }
+    return done;
   },
 
   async delete(store, key) {
     const { t, stores } = await tx(store, 'readwrite');
     stores.delete(key);
-    return new Promise((resolve, reject) => {
-      t.oncomplete = () => resolve();
-      t.onerror = () => reject(t.error);
-    });
+    return transactionDone(t);
+  },
+
+  /* Deletes topic history and every known topic-keyed setting atomically.
+   * Leaves unrelated topics, day-level checks and device/sync state untouched.
+   * Returns { topicid, eventsDeleted } only after commit. Caller owns revisions. */
+  async deleteTopic(topicid) {
+    if (!Number.isSafeInteger(topicid)) throw new Error('deleteTopic requires a safe integer topic ID.');
+    const { t, stores } = await tx(['topics', 'events', 'favorites', 'meta'], 'readwrite');
+    const result = { topicid, eventsDeleted: 0 };
+    const done = transactionDone(t, result);
+    try {
+      stores.topics.delete(topicid);
+      stores.favorites.delete(topicid);
+      const events = stores.events.index('topicid').openCursor(IDBKeyRange.only(topicid));
+      events.onsuccess = () => {
+        const cursor = events.result;
+        if (!cursor) return;
+        cursor.delete();
+        result.eventsDeleted++;
+        cursor.continue();
+      };
+      const maps = ['topicKinds', 'topicMeta', 'topicRoles', 'topicGoals', 'topicPrefs', 'activeTimers'];
+      for (const key of [...maps, 'topicOrder', 'quickBar']) {
+        const req = stores.meta.get(key);
+        req.onsuccess = () => {
+          const row = req.result;
+          if (!row) return;
+          if (maps.includes(key)) {
+            if (!row.value || typeof row.value !== 'object' || Array.isArray(row.value)) return;
+            const value = { ...row.value };
+            delete value[topicid];
+            stores.meta.put({ ...row, value });
+          } else if (Array.isArray(row.value)) {
+            stores.meta.put({ ...row, value: row.value.filter((id) => id !== topicid) });
+          }
+        };
+      }
+    } catch (error) {
+      t.abort();
+      await done.catch(() => {});
+      throw error;
+    }
+    return done;
+  },
+
+  /* Start without replacing another tab's timer or losing other topics'
+   * starts. Returns the committed start timestamp, or null if already running.
+   * Like finishTimer, callers own revisions and any shared Web Lock. */
+  async startTimer(topicid, now = Date.now()) {
+    if (!Number.isSafeInteger(topicid) || !Number.isSafeInteger(now) || Math.abs(now) > 8640000000000000) {
+      throw new Error('startTimer requires a safe topic ID and timestamp.');
+    }
+    const { t, stores } = await tx(['topics', 'meta'], 'readwrite');
+    let started = null, failure, pending = 2;
+    const done = transactionDone(t, () => started);
+    const topicReq = stores.topics.get(topicid);
+    const timerReq = stores.meta.get('activeTimers');
+    const ready = () => {
+      if (--pending) return;
+      try {
+        if (!topicReq.result) throw new Error('Cannot start a timer for a missing topic.');
+        const row = timerReq.result;
+        const timers = row ? row.value : {};
+        if (!timers || typeof timers !== 'object' || Array.isArray(timers)) throw new Error('Invalid active timer metadata.');
+        if (Object.hasOwn(timers, topicid)) return;
+        stores.meta.put({ key: 'activeTimers', value: { ...timers, [topicid]: now } });
+        started = now;
+      } catch (error) {
+        failure = error;
+        t.abort();
+      }
+    };
+    topicReq.onsuccess = ready;
+    timerReq.onsuccess = ready;
+    return done.catch((error) => { throw failure || error; });
+  },
+
+  /* Finish a timer exactly once: event insertion and timer removal commit
+   * together. Returns the event, or null when already stopped/not running.
+   * Caller owns the data lock and revision; this method takes no Web Lock. */
+  async finishTimer(topicid, now = Date.now()) {
+    const validTime = (value) => Number.isSafeInteger(value) && Math.abs(value) <= 8640000000000000;
+    if (!Number.isSafeInteger(topicid) || !validTime(now)) throw new Error('finishTimer requires a safe topic ID and timestamp.');
+    const { t, stores } = await tx(['topics', 'events', 'meta'], 'readwrite');
+    let created = null, failure, pending = 2;
+    const done = transactionDone(t, () => created);
+    const abort = (error) => { failure = error; t.abort(); };
+    const topicReq = stores.topics.get(topicid);
+    const timerReq = stores.meta.get('activeTimers');
+    const ready = () => {
+      if (--pending) return;
+      try {
+        const row = timerReq.result;
+        if (!row) return;
+        if (!row.value || typeof row.value !== 'object' || Array.isArray(row.value)) throw new Error('Invalid active timer metadata.');
+        if (!Object.hasOwn(row.value, topicid)) return;
+        if (!topicReq.result) throw new Error('Cannot finish a timer for a missing topic.');
+        const start = row.value[topicid];
+        if (!validTime(start) || start > now) throw new Error('Invalid timer start; check the device clock.');
+        const timers = { ...row.value };
+        delete timers[topicid];
+        const attempt = () => {
+          try {
+            created = {
+              id: randomId(), topicid, time: start,
+              qant: Math.max(1, Math.round((now - start) / 1000)), cost: 0, note: '',
+            };
+            const request = stores.events.add(created);
+            request.onerror = (event) => {
+              if (request.error?.name !== 'ConstraintError') return;
+              event.preventDefault();
+              event.stopPropagation();
+              attempt();
+            };
+            request.onsuccess = () => {
+              try { stores.meta.put({ ...row, value: timers }); }
+              catch (error) { abort(error); }
+            };
+          } catch (error) { abort(error); }
+        };
+        attempt();
+      } catch (error) { abort(error); }
+    };
+    topicReq.onsuccess = ready;
+    timerReq.onsuccess = ready;
+    return done.catch((error) => { throw failure || error; });
   },
 
   async clear(store) {
     const { t, stores } = await tx(store, 'readwrite');
     stores.clear();
-    return new Promise((resolve, reject) => {
-      t.oncomplete = () => resolve();
-      t.onerror = () => reject(t.error);
-    });
+    return transactionDone(t);
   },
 
   /**
    * Wipe every store, ready for a replace-style import.
    *
    * Device-local meta (which Drive account we talk to, where we are in the
-   * sync conversation) is *not* part of the backup, so it is read back and
-   * re-written afterwards — otherwise restoring from Drive would log the
-   * device out of Drive.
+   * sync conversation) is read and preserved in the SAME transaction.
+   * activeTimers are intentionally cleared, not restored across datasets.
    */
   async clearAll({ keepDeviceMeta = true } = {}) {
-    const keep = {};
-    if (keepDeviceMeta) {
-      for (const k of DEVICE_META_KEYS) {
-        const v = await this.getMeta(k);
-        if (v !== undefined && v !== null) keep[k] = v;
-      }
-    }
-    for (const name of Object.keys(STORES)) {
-      await this.clear(name);
-    }
-    for (const [k, v] of Object.entries(keep)) await this.setMeta(k, v);
+    return this.replaceDataset(Object.fromEntries(Object.keys(STORES).map((name) => [name, []])), { keepDeviceMeta });
   },
 
   async getEventsByTopic(topicid) {
@@ -207,10 +450,10 @@ const db = {
   },
 
   async nextId(store) {
-    const items = await this.getAll(store);
-    let max = 0;
-    for (const it of items) if (it.id > max) max = it.id;
-    return max + 1;
+    if (STORES[store] !== 'id') throw new Error('nextId requires an id-keyed store.');
+    let id;
+    do { id = randomId(); } while (await this.get(store, id));
+    return id; // Legacy candidate only; new callers must use create().
   },
 
   async getMeta(key, fallback = null) {
@@ -236,7 +479,7 @@ const db = {
     return all.map((f) => f.topicid);
   },
 
-  /* Topic kinds: in-app metadata only. Not part of the shared backup schema.
+  /* Topic kinds: portable metadata under the backup's _plotline namespace.
    *   'timeonly' — log a timestamp; qant defaults to 60, no input shown
    *   'duration' — log a hh:mm duration (msureid 10/11/12)
    *   'amount'   — log a numeric amount in the topic's measurement unit
@@ -257,7 +500,7 @@ const db = {
     return (await this.getMeta('topicKinds')) || {};
   },
 
-  /* Topic visual metadata (emoji + color). In-app only, not exported. */
+  /* Portable topic visual metadata (emoji + color). */
   async getTopicMeta(topicId) {
     const map = (await this.getMeta('topicMeta')) || {};
     return map[topicId] || null;
@@ -288,8 +531,7 @@ const db = {
 
   /* Insight topic roles: maps a topic id to { role, dir, timing } where role
    * is focus / marker / influence. Legacy installs may still hold plain role
-   * strings; insights.js migrates those on read. In-app only, not part of the
-   * backup schema. */
+   * strings; insights.js migrates those on read. Included in backups. */
   async getTopicRoles() {
     return (await this.getMeta('topicRoles')) || {};
   },
@@ -308,7 +550,7 @@ const db = {
 
   /* Per-topic goals: maps a topic id to { metric, cmp, target, period, since }.
    * Drives the streak display. Malformed records are filtered out on read by
-   * goals.js. In-app only, not part of the backup schema. */
+   * goals.js. Included in backups. */
   async getTopicGoals() {
     return (await this.getMeta('topicGoals')) || {};
   },

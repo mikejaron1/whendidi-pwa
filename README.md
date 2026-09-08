@@ -4,7 +4,7 @@
 
 A self-hosted, offline-first Progressive Web App for tracking how often
 something happens and how long it's been since the last time — then
-telling you what actually moves those numbers.
+helping you explore associations in your own log.
 
 Log anything you want to keep a count of (symptoms, meds, water, habits,
 chores, moods), see time-since-last at a glance, and let the built-in
@@ -37,12 +37,60 @@ This repo auto-deploys to GitHub Pages on every push to `main`.
 
 ```sh
 cd ~/projects/countwhen
-# (make edits)
+# (make edits, then explicitly stage only the intended release files)
+git add <paths>
 ./deploy.sh "what changed"
-# Wait ~30-60s for Pages to rebuild, then reload the app on the phone.
+# After Pages rebuilds, tap "Update now" when the complete offline update is ready.
 ```
 
 No drag-and-drop, no console clicks. Pages handles the rest.
+
+`deploy.sh` requires `main`, staged changes, and no unstaged or untracked files.
+It runs the Node and real-browser regression suites before committing or pushing.
+It never stages unrelated work automatically.
+
+### Development and regression coverage
+
+```sh
+npm ci
+npm test
+npm run test:browser
+```
+
+Browser coverage uses Playwright Chromium, or installed Google Chrome when the
+Playwright executable is absent. CI installs Chromium explicitly. Every fixture
+is synthetic and browser runs use an isolated profile, never your installed app's
+data or Google account.
+
+`js/version.js` is the single release identifier shared by the app and service
+worker. Bump it for a release. Essential assets must all cache successfully before
+an update is offered; a failed download leaves the previous offline release intact.
+
+### Data and workflow improvements (v8)
+
+- **Complete backups:** goals, goal history, pauses, topic preferences and daily
+  check-ins travel with the existing JSON format. Device timers and Drive
+  connection state do not.
+- **Safer storage:** replacement imports validate before an atomic database
+  replacement. Merge remaps incoming identities and topic settings together.
+  Newly created records use collision-resistant numeric IDs compatible with
+  existing backup readers.
+- **Local reset:** Menu → Reset this device disconnects Drive and removes only
+  local data after a safety export. It does not overwrite the Drive backup.
+- **Quick values and timers:** measured topics ask for a quantity unless you
+  configure an explicit quick-log default. Duration timers persist their start
+  timestamp across app closes and save elapsed seconds when stopped.
+- **Measured observations:** choose Total, Average or Latest for amount topics.
+  Existing history locks its type and unit; use a new topic for a different unit.
+- **Daily check-ins:** confirm complete logging, no events, or an incomplete day.
+  Unobserved days and dates before a topic's tracking start are not automatically
+  symptom-free days in the analysis.
+- **Goal changes:** target revisions preserve historical configurations; pause
+  periods are shown separately rather than counted as failures.
+- **Readable summaries:** export a date-range HTML summary with values and notes;
+  open it offline and print it to PDF. It is not a replacement for a JSON backup.
+- **Accessible navigation:** keyboard-operable views, labeled controls, focused
+  dialogs, visible focus, zoom support, and larger touch targets.
 
 ### Hosting notes
 
@@ -88,12 +136,12 @@ no trailing slash and no path — or every sign-in fails with
 
 ### Logging
 
-- **Categories** — full topic list with time-since-last + last-event
-  date. Big amber ADD button per row. **Long-
+- **Topics** — full topic list with time-since-last + last-event
+  date. A Log button per row. **Long-
   press a card** to drag it into a new order; the order is saved.
   Tap a card to edit/archive/delete the topic. **+ New topic** button
   at the end of the list.
-- **Quick-access bar** — pinned one-tap chips at the top of Categories
+- **Quick-access bar** — pinned chips at the top of Topics
   for fast logging. Stays fixed in place (sticky) and keeps a fixed
   order. Curate exactly which topics appear and their order via
   ☰ menu → **Quick-access bar…**. When none are pinned, the bar falls
@@ -141,12 +189,13 @@ run of misses is visible without reading a number.
 Three rules are worth knowing, because they're what make a streak
 honest:
 
-- **Days you logged nothing still count.** *At most 0* is met exactly
-  on the days you logged nothing, so periods are built by walking the
-  calendar, not by grouping your events.
+- **Missing logs are not automatically successes.** Confirm complete logging or
+  "Nothing happened" to evaluate an empty day. Unknown and incomplete periods
+  remain visible, but neither add to nor break the observed streak.
 - **Today is treated asymmetrically.** An *at least* goal you haven't
   hit yet is still winnable, so it shows as pending and doesn't break
-  the streak. An *at most* goal you've already blown is broken now.
+  the streak. An *at most* goal you've already blown is broken now. The current
+  period is excluded from the completed-period success rate.
 - **A streak can't predate its goal.** It starts from whichever came
   first: the day you set the goal, or your first logged event. Without
   that, *at most 0* would claim a streak running back to the dawn of
@@ -154,6 +203,11 @@ honest:
 
 Days roll over at 4am (configurable), same as everywhere else, so a
 2am log counts toward the night before.
+
+Target edits take effect at the next period boundary. The current period still
+uses its original target, and older periods retain their historical targets.
+Any period touched by a pause is excluded from the rate; a partly paused week is
+shown as partial. Resuming a paused day does not retroactively grade that day.
 
 ### Insights (v7)
 
@@ -207,18 +261,18 @@ finding.
 
 ### Data
 
-- **Import / Export JSON** — round-trips the interchange format
-  byte-for-byte, so nothing is lost on a re-import.
+- **Import / Export JSON** — preserves records, portable settings, and unknown
+  interchange fields (export timestamps and counts are regenerated).
   Import preview shows topic / event counts + date range; choose
   *Replace* (with auto-downloaded safety backup) or *Merge*
-  (deduplicates by event id).
+  (deduplicates identical records and remaps conflicting IDs).
 - **CSV export** — for spreadsheets and anything else.
 - **Offline-first** — service worker caches the app shell, all data
   in IndexedDB. Requests persistent storage so Chrome won't evict.
 - **Installable** — Chrome will offer "Install" on first visit; lives
   as a real app icon on your home screen.
-- **Google Drive sync** — two-way, silent, after every change. Just
-  sign in under ☰ → Google Drive sync; bring your own OAuth client if
+- **Google Drive sync** — opt-in, two-way, automatic after changes once connected.
+  Sign in under ☰ → Google Drive sync; bring your own OAuth client if
   you'd rather. Wi-Fi only by default. Keeps rolling versioned
   snapshots on Drive.
 
@@ -265,11 +319,12 @@ python3 -m http.server 8000 --bind 0.0.0.0
 Then on the phone: `http://<your-mac-IP>:8000`. (Service worker
 *won't* register over LAN HTTP though — install needs HTTPS.)
 
-Five Node smoke tests run without a browser:
+Node smoke suites and isolated browser workflows:
 
 ```sh
-npm install                                # dev-only: jsdom + fake-indexeddb
-npm test                                   # insights + goals + drive + ui
+npm ci                                     # dev-only test dependencies
+npm test                                   # stats, insights, goals, storage, Drive, sync, SW, UI
+npm run test:browser                        # Chromium workflows; install it with npx playwright install chromium
 
 node insights-smoke.js                     # statistics engine + role migration
 node goals-smoke.js                        # streak rules and edge cases
@@ -327,8 +382,10 @@ Self-hosting for a group and want *everyone* on your own project? Set
 `driveClientId` in `js/config.js` instead — that becomes the default for
 that deployment (set it to `''` to ship with Drive sync off entirely).
 
-Either way, the app silently syncs to Drive a few seconds after every
-change, and at launch.
+Once you explicitly connect, the app attempts background sync after changes and
+at launch. Expired authorization may require a foreground tap; it does not open
+an account picker in a hidden tab. Disconnecting disables automatic sync on that
+device without deleting the remote backup.
 
 ### Sync behavior
 
@@ -351,8 +408,12 @@ pending times and app settings:
 - Edited differently on both sides → whichever device was touched most
   recently wins, and the sync reports how many conflicts it resolved.
 
-So two phones can both log freely and converge. Merges that pull in
-remote changes refresh the UI and tell you what arrived.
+Merges that pull in remote changes refresh the UI and tell you what arrived.
+Remote version checks, readback, and bounded retries detect many concurrent
+writes, but do not provide a server-side compare-and-swap guarantee. A simultaneous
+write can still race, and simultaneous first connections can create duplicate
+folders. Five local recovery snapshots are retained for export, including
+confirmed uploads; keep independent JSON backups for important history.
 
 Other behaviour:
 
@@ -368,7 +429,7 @@ Other behaviour:
   downloading a safety backup. Use it for a fresh device or a bad
   mistake — day to day, plain sync is what you want.
 - Rolling snapshots (`plotline-1.json`, `-2.json`, … up to 5) are kept
-  beside the live file so an older copy is always recoverable. So the
+  beside the live file to provide older recovery points. The
   Drive folder normally holds up to six similar-looking files: that's
   expected. A snapshot is only cut when the live file's contents
   actually changed *and* the newest snapshot is at least 12h old, so the
