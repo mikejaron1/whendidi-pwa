@@ -78,6 +78,40 @@ async function run() {
   assert.deepEqual(copy((await IO.buildExportObject())._plotline), future._plotline);
   await IO.importReplace(exported);
 
+  for (const namespace of ['_plotline', '_countwhen', '_wdapp']) {
+    const legacy = copy(exported);
+    const app = legacy._plotline;
+    delete legacy._plotline;
+    app.insightSettings = { ...app.insightSettings, alertOn: 'flare',
+      alertsEnabled: false, futureAlertOption: { enabled: true } };
+    legacy[namespace] = app;
+    const original = copy(legacy);
+    assert.deepEqual(copy(IO.validateBackup(legacy)), []);
+    for (const method of ['importReplace', 'importMerge', 'applyBackup']) {
+      await IO.importReplace(exported);
+      await IO[method](legacy);
+      const settings = await DB.getMeta('insightSettings');
+      assert.equal(settings.alertOn, 'alert', `${method} should migrate ${namespace}`);
+      assert.equal(settings.alertsEnabled, false);
+      assert.deepEqual(copy(settings.futureAlertOption), { enabled: true });
+      const roundtrip = copy(await IO.buildExportObject());
+      assert.equal(roundtrip._plotline.insightSettings.alertOn, 'alert');
+      assert.deepEqual(roundtrip.events, exported.events);
+      assert.deepEqual(roundtrip._plotline.topicGoals, exported._plotline.topicGoals);
+      assert.deepEqual(legacy, original, 'migration must not mutate the source backup');
+    }
+  }
+  await DB.setMeta('insightSettings', { alertOn: 'flare', alertsEnabled: false, cutoffHour: 4 });
+  assert.equal((await DB.getInsightSettings()).alertOn, 'alert');
+  assert.equal((await IO.buildExportObject())._plotline.insightSettings.alertOn, 'alert');
+  assert.equal((await DB.setInsightSettings({ windowDays: 14 })).alertOn, 'alert');
+  assert.equal((await DB.getMeta('insightSettings')).alertOn, 'alert');
+  for (const alertOn of ['watch', 'alert']) {
+    assert.equal((await DB.setInsightSettings({ alertOn })).alertOn, alertOn);
+  }
+  await IO.importReplace(exported);
+  console.log('PASS legacy alert thresholds migrate without changing logs, goals or unknown settings');
+
   const malformed = [
     null, [], { topics: null, events: [] }, { topics: [], events: [null] },
     { topics: [null], events: [] }, { topics: [], events: {}, measurements: {} },
@@ -100,6 +134,10 @@ async function run() {
     { topics: [topic(1, 'a')], events: [], _plotline: { favorites: [null] } },
     { topics: [topic(1, 'a')], events: [], measurements: [null] },
     { topics: [topic(1, 'a')], events: [], appdata: [null], pendtimes: [null] },
+    ...['bogus', '', 'FLARE', null, true, 1, {}, []].map((alertOn) => ({
+      topics: [topic(1, 'a')], events: [],
+      _plotline: { insightSettings: { alertOn, alertsEnabled: false } },
+    })),
   ];
   const before = await snapshot();
   for (const bad of malformed) {

@@ -100,6 +100,11 @@ const DEVICE_META_KEYS = [
   'driveFolderId', 'drivePendingSnapshot', 'dataRevision',
 ];
 
+function normalizeInsightSettings(settings) {
+  // v6 used "flare" for the alert-only threshold; the meaning is unchanged.
+  return { ...settings, ...(settings.alertOn === 'flare' ? { alertOn: 'alert' } : {}) };
+}
+
 function randomId() {
   if (!window.crypto?.getRandomValues) throw new Error('Secure random IDs require crypto.getRandomValues.');
   const words = new Uint32Array(2);
@@ -568,9 +573,11 @@ const db = {
   },
 
   /* Insight / alert settings. */
+  normalizeInsightSettings,
+
   async getInsightSettings() {
     const s = (await this.getMeta('insightSettings')) || {};
-    return {
+    return normalizeInsightSettings({
       cutoffHour: 4,          // logical day rolls over at 4am
       windowDays: 7,          // "current" window for status detection
       insightWindow: 90,      // lookback for narrative insights
@@ -582,12 +589,12 @@ const db = {
       lastAlertAt: 0,
       lastAlertLevel: '',
       ...s,
-    };
+    });
   },
 
   async setInsightSettings(patch) {
     const cur = await this.getInsightSettings();
-    const next = { ...cur, ...patch };
+    const next = normalizeInsightSettings({ ...cur, ...patch });
     await this.setMeta('insightSettings', next);
     return next;
   },

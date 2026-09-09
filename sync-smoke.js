@@ -6,8 +6,10 @@ const vm = require('vm');
 const { JSDOM } = require('jsdom');
 const { IDBFactory, IDBKeyRange } = require('fake-indexeddb');
 const source = fs.readFileSync(require('path').join(__dirname, 'js/drive.js'), 'utf8');
-const ioContext = { window: {}, CWDB: { DEVICE_META_KEYS: [] } };
+const ioContext = { window: {} };
 vm.createContext(ioContext);
+vm.runInContext(fs.readFileSync(require('path').join(__dirname, 'js/db.js'), 'utf8'), ioContext);
+ioContext.CWDB = ioContext.window.CWDB;
 vm.runInContext(fs.readFileSync(require('path').join(__dirname, 'js/import-export.js'), 'utf8'), ioContext);
 const clone = (value) => value == null ? value : JSON.parse(JSON.stringify(value));
 const backup = (overrides = {}) => ({
@@ -35,7 +37,8 @@ function harness(initial = backup(), remote = clone(initial)) {
     CustomEvent: class { constructor(type, opts) { this.type = type; this.detail = opts.detail; } },
     window: { CW_CONFIG: { driveClientId: 'test', autoSyncOnChange: true, autoSyncOnStartup: true },
       addEventListener() {}, dispatchEvent(e) { state.statuses.push(e); } },
-    CWDB: { async getMeta(key, fallback = null) { return meta.has(key) ? clone(meta.get(key)) : fallback; },
+    CWDB: { normalizeInsightSettings: ioContext.CWDB.normalizeInsightSettings,
+      async getMeta(key, fallback = null) { return meta.has(key) ? clone(meta.get(key)) : fallback; },
       async setMeta(key, value) { meta.set(key, clone(value)); } },
     CWIO: {
       async buildExportObject() { state.reads++; await state.onBuild?.(); return clone(state.local); },
@@ -113,6 +116,44 @@ async function test(name, fn) {
 }
 
 (async () => {
+  await test('real storage: legacy remote alert thresholds sync and restore in every namespace', async () => {
+    for (const namespace of ['_plotline', '_countwhen', '_wdapp']) {
+      const h = await storageHarness();
+      const app = h.state.remote._plotline;
+      delete h.state.remote._plotline;
+      app.insightSettings = { alertOn: 'flare', alertsEnabled: false, cutoffHour: 4 };
+      h.state.remote[namespace] = app;
+      const events = clone(h.state.remote.events);
+      await h.api.syncNow();
+      assert.equal((await h.db.getMeta('insightSettings')).alertOn, 'alert');
+      assert.equal(h.state.remote._plotline.insightSettings.alertOn, 'alert');
+      assert.deepEqual(h.state.remote.events, events);
+      h.state.remote._plotline.insightSettings.alertOn = 'flare';
+      await h.api.syncDown();
+      assert.equal((await h.db.getMeta('insightSettings')).alertOn, 'alert');
+      assert.equal((await h.io.buildExportObject())._plotline.insightSettings.alertOn, 'alert');
+    }
+  });
+  await test('legacy flare and current alert compare equally without overriding a local watch preference', async () => {
+    const base = backup({ _plotline: { insightSettings: { alertOn: 'flare', alertsEnabled: false } } });
+    const remote = clone(base);
+    remote._plotline.insightSettings.alertOn = 'alert';
+    const h = harness(base, remote);
+    h.state.local._plotline.insightSettings.alertOn = 'watch';
+    const result = await h.api.syncNow();
+    assert.equal(h.state.remote._plotline.insightSettings.alertOn, 'watch');
+    assert.equal(result.stats.conflicts, 0);
+  });
+  await test('invalid remote alert thresholds still reject without overwriting either dataset', async () => {
+    const h = await storageHarness();
+    h.state.remote._plotline.insightSettings = { alertOn: 'bogus' };
+    const before = clone(await h.db.getDataset());
+    await assert.rejects(h.api.syncNow(), /INVALID_REMOTE: alertOn: invalid alert level/);
+    assert.equal(h.state.writes, 0);
+    assert.deepEqual(clone(await h.db.getAll('topics')), before.topics);
+    assert.deepEqual(clone(await h.db.getAll('events')), before.events);
+    assert.equal(await h.db.getMeta('insightSettings'), null);
+  });
   await test('real storage: ordinary metadata/event sync preserves a running timer; restore clears it', async () => {
     const h = await storageHarness();
     await h.db.startTimer(1, 1000);

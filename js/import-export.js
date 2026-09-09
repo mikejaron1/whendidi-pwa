@@ -12,7 +12,9 @@ const APP_META_TOP_KEY = '_plotline';
 const LEGACY_APP_META_TOP_KEYS = ['_countwhen', '_wdapp'];
 
 const readAppMeta = (obj) => {
-  return [APP_META_TOP_KEY, ...LEGACY_APP_META_TOP_KEYS].reduce((app, key) => existingWins(app, obj?.[key] || {}), {});
+  const app = [APP_META_TOP_KEY, ...LEGACY_APP_META_TOP_KEYS].reduce((app, key) => existingWins(app, obj?.[key] || {}), {});
+  if (app.insightSettings != null) app.insightSettings = CWDB.normalizeInsightSettings(app.insightSettings);
+  return app;
 };
 
 const KNOWN_TOP_KEYS = new Set([
@@ -53,7 +55,7 @@ async function buildAppMeta(dataset) {
   const out = { ...portable(meta.extraAppMeta), backupSchemaVersion: meta.backupSchemaVersion ?? BACKUP_SCHEMA_VERSION };
   for (const k of APP_META_KEYS) {
     const v = meta[k];
-    if (v != null) out[k] = k === 'insightSettings' ? portable(v) : v;
+    if (v != null) out[k] = k === 'insightSettings' ? portable(CWDB.normalizeInsightSettings(v)) : v;
   }
   const favs = dataset ? dataset.favorites : await CWDB.getAll('favorites');
   if (favs.length) out.favorites = favs;
@@ -65,7 +67,7 @@ async function applyAppMeta(app) {
     assertValid({ topics: dataset.topics, events: dataset.events, measurements: dataset.measurements, [APP_META_TOP_KEY]: app });
     const meta = new Map(dataset.meta.map((r) => [r.key, r.value]));
     if (app.backupSchemaVersion != null) meta.set('backupSchemaVersion', Math.max(meta.get('backupSchemaVersion') || BACKUP_SCHEMA_VERSION, app.backupSchemaVersion));
-    for (const k of APP_META_KEYS) if (app[k] != null) meta.set(k, k === 'insightSettings' ? portable(app[k]) : app[k]);
+    for (const k of APP_META_KEYS) if (app[k] != null) meta.set(k, k === 'insightSettings' ? portable(CWDB.normalizeInsightSettings(app[k])) : app[k]);
     meta.set('extraAppMeta', { ...meta.get('extraAppMeta'), ...unknownAppFields(app) });
     dataset.meta = Array.from(meta, ([key, value]) => ({ key, value }));
     if (app.favorites) dataset.favorites = app.favorites;
@@ -221,7 +223,7 @@ function validateBackup(obj) {
     if (Object.hasOwn(app, 'insightSettings')) {
       const settings = app.insightSettings;
       if (!record(settings)) fail(`${namespace}.insightSettings`, 'must be an object');
-      else for (const [key, value] of Object.entries(settings)) {
+      else for (const [key, value] of Object.entries(CWDB.normalizeInsightSettings(settings))) {
         if (['cutoffHour', 'nightStart', 'nightEnd'].includes(key) && (!finite(value) || value < 0 || value >= 24)) fail(key, 'invalid hour');
         if (['windowDays', 'insightWindow', 'alertCooldownHours'].includes(key) && (!finite(value) || value <= 0)) fail(key, 'must be positive');
         if (key === 'alertsEnabled' && typeof value !== 'boolean') fail(key, 'must be boolean');
@@ -304,6 +306,7 @@ async function importMerge(obj) {
   const incoming = prepareBackup(obj);
   return CWDB.updateDataset((current) => {
     const meta = Object.fromEntries(current.meta.map((r) => [r.key, r.value]));
+    if (meta.insightSettings != null) meta.insightSettings = CWDB.normalizeInsightSettings(meta.insightSettings);
     const incomingMeta = Object.fromEntries(incoming.meta.map((r) => [r.key, r.value]));
     const allocate = (name) => {
       const used = new Set([...current[name], ...incoming[name]].map((r) => r.id));

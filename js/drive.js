@@ -514,7 +514,9 @@ function sameRecord(a, b) {
 
 function readApp(o) {
   if (!o) return undefined;
-  return o[APP_META_KEY] || LEGACY_APP_META_KEYS.map((k) => o[k]).find(Boolean);
+  const app = o[APP_META_KEY] || LEGACY_APP_META_KEYS.map((k) => o[k]).find(Boolean);
+  return app?.insightSettings != null
+    ? { ...app, insightSettings: CWDB.normalizeInsightSettings(app.insightSettings) } : app;
 }
 
 /* Ignore presentation timestamps/counts when deciding whether to replace local
