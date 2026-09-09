@@ -37,11 +37,12 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     await page.goto(`http://127.0.0.1:${server.address().port}/app/`);
     await page.locator('[data-preset="habits"]').click();
     await page.waitForFunction(() => document.querySelectorAll('#main .card').length === 5);
+    await page.evaluate(() => CWMODEL.whenIdle());
     assert.equal(await page.locator('#modalRoot .dialog').count(), 0);
 
     // Quick amounts are real quantities, and Undo accepts pointer input.
     const waterId = await page.evaluate(() => state.topics.find((topic) => topic.name === 'Water').id);
-    await page.evaluate(async (id) => { await saveQuickBar([id]); }, waterId);
+    await page.evaluate((id) => CWMODEL.mutate(() => saveQuickBar([id])), waterId);
     await page.locator(`[data-quick="${waterId}"]`).click();
     await page.waitForFunction(() => !!document.querySelector('#snackUndoBtn'));
     assert.equal(await page.evaluate(async () => (await CWDB.getAll('events'))[0].qant), 8);
@@ -50,7 +51,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
 
     // Missing quick defaults open the editor; timer state survives a reload.
     const sleepId = await page.evaluate(() => state.topics.find((topic) => topic.name === 'Sleep').id);
-    await page.evaluate(async (id) => { await saveQuickBar([id]); }, sleepId);
+    await page.evaluate((id) => CWMODEL.mutate(() => saveQuickBar([id])), sleepId);
     await page.locator(`[data-quick="${sleepId}"]`).click();
     await page.getByRole('dialog').waitFor();
     assert.equal(await page.evaluate(() => {
@@ -61,6 +62,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     }), true);
     await page.locator('#startTimer').click();
     await page.waitForFunction(() => !document.querySelector('.dialog'));
+    await page.evaluate(() => CWMODEL.whenIdle());
     await page.reload();
     await page.waitForFunction(() => document.querySelector('[data-stop-timer]'));
     await page.locator('[data-stop-timer]').click();
@@ -126,6 +128,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     await page.keyboard.press('Escape');
 
     // Updates drain already accepted writes before asking the worker to activate.
+    await page.evaluate((id) => CWMODEL.mutate(() => saveQuickBar([id])), waterId);
     await page.evaluate(() => {
       window.workerActivated = false;
       CWAPP.watchUpdates({ waiting: {
@@ -135,7 +138,6 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       navigator.locks.request('plotline-data', () => new Promise((resolve) => { window.releaseDataLock = resolve; }));
     });
     await page.waitForFunction(() => typeof window.releaseDataLock === 'function');
-    await page.evaluate(async (id) => { await saveQuickBar([id]); }, waterId);
     const beforeUpdate = await page.evaluate(async () => (await CWDB.getAll('events')).length);
     await page.locator(`[data-quick="${waterId}"]`).click();
     await page.locator('#installUpdate').click();
